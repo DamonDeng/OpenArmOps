@@ -13,6 +13,8 @@ import logging
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
+    QDoubleSpinBox,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,6 +25,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .robot_service import RobotService
+from .runtime_state import RuntimeState
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +63,38 @@ class _CalibWorker(QObject):
 
 
 class SystemTab(QWidget):
-    def __init__(self, robot: RobotService, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        robot: RobotService,
+        state: RuntimeState,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.robot = robot
+        self.state = state
         self._thread: QThread | None = None
         self._worker: _CalibWorker | None = None
 
         root = QVBoxLayout(self)
+
+        # ── Motion settings ────────────────────────────────────────────
+        speed_box = QGroupBox("Motion settings (apply to both arms)")
+        speed_form = QFormLayout(speed_box)
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setDecimals(1)
+        self.speed_spin.setRange(0.1, 120.0)
+        self.speed_spin.setSingleStep(1.0)
+        self.speed_spin.setSuffix(" °/s")
+        self.speed_spin.setValue(self.state.max_speed_deg_per_sec)
+        self.speed_spin.valueChanged.connect(self._on_speed_changed)
+        speed_form.addRow("Max commanded speed:", self.speed_spin)
+        speed_hint = QLabel(
+            "Per-tick step = max_speed / poll_hz. At 5 Hz, 5°/s = 1°/tick.\n"
+            "Raise as confidence grows; safe bring-up value is 5°/s."
+        )
+        speed_hint.setStyleSheet("color: gray;")
+        speed_form.addRow(speed_hint)
+        root.addWidget(speed_box)
 
         # ── Calibration group ──────────────────────────────────────────
         cal_box = QGroupBox("Calibration")
@@ -187,3 +215,7 @@ class SystemTab(QWidget):
             self.btn_zero_left, self.btn_zero_right,
         ):
             b.setEnabled(enabled)
+
+    def _on_speed_changed(self, value: float) -> None:
+        self.state.max_speed_deg_per_sec = float(value)
+        logger.info(f"max commanded speed set to {value:.1f} °/s")

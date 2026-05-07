@@ -32,6 +32,10 @@ class RobotService:
         self._lock = threading.Lock()
         self._robot: BiOpenArmFollower | None = None
         self._connected = False
+        # Tracks whether cameras are known-dead. We log the transition ONCE
+        # (not per tick) and then fall back to a state-only observation until
+        # the app is restarted. No auto-reconnect by design.
+        self._cameras_dead = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -180,13 +184,59 @@ class RobotService:
             logger.warning("EMERGENCY STOP: torque disabled on both arms.")
 
     # ------------------------------------------------------------------
-    # IO (used by later milestones — stubbed for M1)
+    # IO
     # ------------------------------------------------------------------
     def get_observation(self) -> dict | None:
+        """Return the robot observation, tolerating camera failures.
+
+        Normal path: delegates to BiOpenArmFollower.get_observation, which
+        reads all motor states over CAN and one frame per camera.
+
+        If any camera raises (e.g. USB disconnect → ``RuntimeError: read
+        thread is not running``), we switch to a state-only fallback that
+        only reads motor positions. Cameras stay dead until app restart;
+        we log the transition once to avoid flooding the console.
+        """
         with self._lock:
             if not self._connected or self._robot is None:
                 return None
-            return self._robot.get_observation()
+
+            if not self._cameras_dead:
+                try:
+                    return self._robot.get_observation()
+                except RuntimeError as e:
+                    # Most camera failures surface as RuntimeError from the
+                    # OpenCVCamera reader thread. Log once and fall through
+                    # to the state-only path.
+                    self._cameras_dead = True
+                    logger.error(
+                        f"Camera read failed ({e!s}). Switching to state-only "
+                        "observations for the rest of this session."
+                    )
+
+            # State-only path (cameras dead). Read motor state directly from
+            # each bus and build the same key layout BiOpenArmFollower would
+            # emit, minus the camera entries.
+            obs: dict = {}
+            try:
+                right_states = self._robot.right_arm.bus.sync_read_all_states()
+                for motor, state in right_states.items():
+                    obs[f"right_{motor}.pos"] = state.get("position", 0.0)
+                    obs[f"right_{motor}.vel"] = state.get("velocity", 0.0)
+                    obs[f"right_{motor}.torque"] = state.get("torque", 0.0)
+                left_states = self._robot.left_arm.bus.sync_read_all_states()
+                for motor, state in left_states.items():
+                    obs[f"left_{motor}.pos"] = state.get("position", 0.0)
+                    obs[f"left_{motor}.vel"] = state.get("velocity", 0.0)
+                    obs[f"left_{motor}.torque"] = state.get("torque", 0.0)
+            except Exception as e:
+                logger.exception(f"Fallback state read failed: {e}")
+                return None
+            return obs
+
+    @property
+    def cameras_dead(self) -> bool:
+        return self._cameras_dead
 
     def send_action(self, action: dict) -> None:
         with self._lock:

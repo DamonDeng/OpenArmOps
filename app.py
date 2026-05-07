@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
 from . import config
 from .key_bindings import load_bindings
 from .robot_service import RobotService
+from .runtime_state import RuntimeState
 from .tab_controller import ControllerTab
 from .tab_system import SystemTab
 
@@ -32,15 +33,16 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, robot: RobotService) -> None:
+    def __init__(self, robot: RobotService, state: RuntimeState) -> None:
         super().__init__()
         self.robot = robot
+        self.state = state
         self.setWindowTitle("OpenArm Controller (LeRobot direct)")
         self.resize(1200, 800)
 
         tabs = QTabWidget()
-        self.controller_tab = ControllerTab(robot)
-        self.system_tab = SystemTab(robot)
+        self.controller_tab = ControllerTab(robot, state)
+        self.system_tab = SystemTab(robot, state)
         tabs.addTab(self.controller_tab, "Controller")
         tabs.addTab(self.system_tab, "System")
         self.setCentralWidget(tabs)
@@ -49,7 +51,14 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self._connection_label = QLabel("disconnected")
         self.status.addWidget(self._connection_label)
+        self._warning_label = QLabel("")
+        self._warning_label.setStyleSheet("color: #c44; font-weight: bold;")
+        self.status.addPermanentWidget(self._warning_label)
+        self.controller_tab.warning_changed.connect(self._on_warning_changed)
         self._refresh_status()
+
+    def _on_warning_changed(self, msg: str) -> None:
+        self._warning_label.setText(msg)
 
     def _refresh_status(self) -> None:
         text = "connected, torque OFF" if self.robot.connected else "disconnected"
@@ -93,7 +102,8 @@ def main() -> int:
         )
         return 2
 
-    window = MainWindow(robot)
+    state = RuntimeState()
+    window = MainWindow(robot, state)
     window.show()
     return app.exec_()
 

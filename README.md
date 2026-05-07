@@ -7,20 +7,31 @@ for bring-up, calibration, and exploration.
 
 ## Status
 
-**M2 — Controller tab populated (read-only commanding).**
-- Camera strip at the top: LEFT wrist / BASE / RIGHT wrist, updated at 5 Hz.
-- 16 sliders across two columns (RIGHT arm, LEFT arm), each showing the joint's
-  safe range, a target readout, and a live "current" readout from the motor.
-- Per-arm **Torque ON/OFF** toggle above each slider column.
-- **EMERGENCY STOP** button disables torque on both arms.
-- On startup sliders show 0°; on the first poll tick they snap to the current
-  motor position so the later command path won't jump when torque is enabled.
+**M3 — sliders command the arm (ramped control loop, in testing).**
 
-**M2 limitation — sliders are read-only.** Moving a slider updates the target
-readout but does NOT yet call `send_action`. Command dispatch lands in M3.
+Each poll tick (5 Hz):
 
-Upcoming milestones: slider send_action (M3), keyboard shortcuts + reloadable
-bindings (M4), motor info display + editable kp/kd (M5 / v3).
+1. Read observation; update every joint's `current`.
+2. For each joint on a torque-ON arm, step its `commanded` toward its
+   `target` (= slider position) by at most `max_speed / 5` degrees.
+3. Send one `send_action(dict)` with the new commanded values for every
+   torque-ON joint.
+4. For torque-OFF arms, keep target and commanded synced with current so
+   enabling torque later won't lurch.
+
+**Three values per joint** — slider (target, user), commanded (what we
+send each tick), current (motor reads back). Each slider paints an amber
+tick mark at the current position so you can watch it chase the thumb.
+
+- **Max commanded speed** is a global setting on the System tab (default
+  5 °/s; range 0.1–120 °/s). Changes take effect on the next poll tick.
+- **Emergency stop** now also resets every target to its current position,
+  so toggling torque back on doesn't resume an interrupted motion.
+- **Enabling torque** on an arm first aligns target & commanded with the
+  last observed current, so the arm doesn't jump when torque engages.
+
+Upcoming: keyboard shortcuts + reloadable bindings (M4), motor info
+display + editable kp/kd (M5 / v3).
 
 ## Prerequisites
 

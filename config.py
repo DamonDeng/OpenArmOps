@@ -42,6 +42,12 @@ USE_FULL_LIMITS = True  # True ⇒ per-side ranges (75°/135°/etc), False ⇒ �
 POLL_HZ = 5  # rate for reading observations (state + cameras)
 SEND_MAX_HZ = 5  # rate limit for send_action while dragging sliders
 
+# Initial cap on commanded joint velocity. Every poll tick the per-joint
+# commanded value moves toward the slider target by at most
+# MAX_SPEED_DEG_PER_SEC / POLL_HZ degrees. Runtime-editable from the
+# System tab — this constant only seeds the spinbox on startup.
+INITIAL_MAX_SPEED_DEG_PER_SEC = 5.0
+
 # Per-keystroke deltas (degrees). Shift = coarse, Ctrl = fine.
 KEY_DELTA_DEFAULT = 1.0
 KEY_DELTA_SHIFT = 3.0  # matches MAX_RELATIVE_TARGET_DEG to avoid silent clipping
