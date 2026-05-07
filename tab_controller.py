@@ -121,7 +121,10 @@ class ControllerTab(QWidget):
         self.joint_uis: dict[tuple[str, str], _JointUI] = {}
         self.torque_buttons: dict[str, QPushButton] = {}
 
-        for arm in ("right", "left"):  # visual left→right: we put right first
+        # Column order matches the camera strip: left arm on the left,
+        # right arm on the right. Feels natural when you're standing in
+        # front of the robot.
+        for arm in ("left", "right"):
             col = self._build_arm_column(arm)
             cols_row.addWidget(col)
         root.addLayout(cols_row, stretch=1)
