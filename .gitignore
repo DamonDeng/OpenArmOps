@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local overrides (once we add them)
+config_local.py
+key_bindings.local.json

@@ -1,0 +1,13 @@
+{
+  "_comment": "Maps keyboard keys → (arm_side, joint_name, direction). direction is +1 or -1 and is multiplied by the active delta (default / shift=coarse / ctrl=fine) to produce a per-keypress target offset. Keys must be single characters; case-insensitive; Shift/Ctrl modifiers are applied automatically at runtime, do NOT include them here.",
+  "bindings": [
+    {"key": "s", "arm": "left",  "joint": "joint_1", "direction": -1, "note": "left j1 negative"},
+    {"key": "f", "arm": "left",  "joint": "joint_1", "direction":  1, "note": "left j1 positive"},
+    {"key": "e", "arm": "left",  "joint": "joint_2", "direction":  1, "note": "left j2 positive"},
+    {"key": "d", "arm": "left",  "joint": "joint_2", "direction": -1, "note": "left j2 negative"},
+    {"key": "j", "arm": "right", "joint": "joint_1", "direction": -1, "note": "right j1 negative"},
+    {"key": "l", "arm": "right", "joint": "joint_1", "direction":  1, "note": "right j1 positive"},
+    {"key": "i", "arm": "right", "joint": "joint_2", "direction":  1, "note": "right j2 positive"},
+    {"key": "k", "arm": "right", "joint": "joint_2", "direction": -1, "note": "right j2 negative"}
+  ]
+}
