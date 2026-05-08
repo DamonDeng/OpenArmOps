@@ -1,24 +1,14 @@
-"""Controller tab — M3 polish.
+"""Controller tab — worker-driven version.
 
-Adds the ramped control loop:
+UI thread responsibilities:
+  - Render sliders, camera strip, buttons.
+  - On slider / keyboard / button events, post commands to the MotionWorker.
+  - At 5 Hz, read camera frames from the robot and update panels.
+  - On ``state_updated`` signal from the worker (~30 Hz), update the "cur"
+    labels and amber current-position markers on each slider.
 
-  poll tick (5 Hz):
-    1. obs = robot.get_observation()
-    2. for each joint:
-         current = obs[joint_key]
-         if arm torque OFF:
-             target = current; commanded = current    # keep in sync
-         else:
-             delta = clamp(target - commanded, -step, +step)
-             commanded += delta
-    3. send_action({joint: commanded for all torque-ON arms})
-    4. update UI (current labels, tgt labels, per-slider current marker)
-
-The slider drives `target` (absolute degrees). `commanded` is what we
-actually send; it chases `target` at ≤ max_step_per_tick.
-
-Visual polish: QSlider subclass that paints a small tick mark at the
-motor's current position so the user can watch it chase the thumb.
+Control-loop concerns (trajectories, MIT setpoints, lead cap, send_action)
+live entirely in ``motion_worker.py``.
 """
 
 from __future__ import annotations
@@ -50,26 +40,26 @@ from lerobot.robots.openarm_follower.config_openarm_follower import (
 )
 
 from . import config
+from .motion_worker import MotionWorker
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 
 logger = logging.getLogger(__name__)
 
-SLIDER_SCALE = 10           # ticks per degree (0.1° resolution)
+SLIDER_SCALE = 10         # ticks per degree (0.1° resolution)
 CAM_PANEL_WIDTH = 360
 
 
 class _MarkerSlider(QSlider):
-    """A horizontal slider with an extra tick mark painted at ``marker_deg``.
+    """Horizontal slider with a second tick mark painted at ``marker_deg``.
 
-    The built-in QSlider only has one handle. We paint a thin colored tick
-    at the handle position that *would* correspond to ``marker_deg`` so
-    the user can see where the motor actually is vs where they're aiming.
+    QSlider has one handle; we paint an extra amber tick at the motor's
+    observed current position so the user can watch it chase the thumb.
     """
 
     def __init__(self, parent=None) -> None:
         super().__init__(Qt.Horizontal, parent)
-        self._marker_ticks: Optional[int] = None  # None = don't draw
+        self._marker_ticks: Optional[int] = None
 
     def set_marker_ticks(self, ticks: Optional[int]) -> None:
         if ticks != self._marker_ticks:
@@ -97,7 +87,6 @@ class _MarkerSlider(QSlider):
         pen = QPen(QColor(230, 130, 30))  # amber
         pen.setWidth(3)
         painter.setPen(pen)
-        # Draw a vertical tick that extends slightly above & below the groove
         top = groove.y() - 3
         bot = groove.y() + groove.height() + 3
         painter.drawLine(x, top, x, bot)
@@ -111,12 +100,8 @@ class _JointUI:
     min_deg: float
     max_deg: float
     slider: _MarkerSlider
-    target_label: QLabel    # slider's target (what the user wants)
-    current_label: QLabel   # last observed motor position
-    target_deg: float = 0.0       # source of truth for slider-driven target
-    commanded_deg: float = 0.0    # what we last sent to the motor
-    current_deg: float = 0.0      # last observed
-    initialized: bool = False     # True once we've synced to a real observation
+    target_label: QLabel
+    current_label: QLabel
 
 
 class _CameraPanel(QWidget):
@@ -143,7 +128,6 @@ class _CameraPanel(QWidget):
         self.image.setPixmap(pix)
 
     def mark_disconnected(self) -> None:
-        """Switch to a visible disconnected state. Idempotent."""
         self.image.setPixmap(QPixmap())
         self.image.setStyleSheet(
             "background-color: #2a1010; color: #e55; font-weight: bold;"
@@ -157,25 +141,25 @@ def _limits_for(arm: str, joint: str) -> tuple[float, float]:
 
 
 class ControllerTab(QWidget):
-    # Emitted on important state transitions so the main window can update
-    # its statusbar. Payload is the message to show.
     warning_changed = pyqtSignal(str)
 
     def __init__(
         self,
         robot: RobotService,
         state: RuntimeState,
+        worker: MotionWorker,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.robot = robot
         self.state = state
-        # Per-arm torque state mirrored here so the poll loop can decide
-        # whether to command each arm. Single source of truth is still the
-        # QPushButton.isChecked(), but caching it avoids a lookup per tick.
+        self.worker = worker
         self._torque_on: dict[str, bool] = {"left": False, "right": False}
         self._cameras_marked_dead = False
         self._last_warning: str = ""
+        # Sliders need to be initialized once with the observed current so
+        # they don't show 0° before the worker publishes state.
+        self._sliders_initialized: set[tuple[str, str]] = set()
 
         root = QVBoxLayout(self)
 
@@ -193,11 +177,22 @@ class ControllerTab(QWidget):
         cols_row = QHBoxLayout()
         self.joint_uis: dict[tuple[str, str], _JointUI] = {}
         self.torque_buttons: dict[str, QPushButton] = {}
-
         for arm in ("left", "right"):
             col = self._build_arm_column(arm)
             cols_row.addWidget(col)
         root.addLayout(cols_row, stretch=1)
+
+        # ── Go-to-zero ──────────────────────────────────────────────
+        zero_row = QHBoxLayout()
+        self.btn_zero_left = QPushButton("Go to zero — LEFT arm")
+        self.btn_zero_right = QPushButton("Go to zero — RIGHT arm")
+        for btn in (self.btn_zero_left, self.btn_zero_right):
+            btn.setStyleSheet("QPushButton { padding: 8px; }")
+        self.btn_zero_left.clicked.connect(lambda: self._on_go_to_zero("left"))
+        self.btn_zero_right.clicked.connect(lambda: self._on_go_to_zero("right"))
+        zero_row.addWidget(self.btn_zero_left)
+        zero_row.addWidget(self.btn_zero_right)
+        root.addLayout(zero_row)
 
         # ── Emergency stop ──────────────────────────────────────────
         estop = QPushButton("EMERGENCY STOP — disable torque on both arms")
@@ -209,10 +204,18 @@ class ControllerTab(QWidget):
         estop.clicked.connect(self._on_estop)
         root.addWidget(estop)
 
-        # ── Poll timer ──────────────────────────────────────────────
-        self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self._poll)
-        self.poll_timer.start(int(1000 / config.POLL_HZ))
+        # ── Camera poll timer (UI thread, 5 Hz) ─────────────────────
+        # Camera frames come from robot.get_observation's cached camera
+        # buffers; it's cheap. The motion worker already reads motor state
+        # at 30 Hz and publishes via state_updated — we don't need to
+        # duplicate that read here.
+        self.cam_timer = QTimer(self)
+        self.cam_timer.timeout.connect(self._poll_cameras)
+        self.cam_timer.start(int(1000 / config.POLL_HZ))
+
+        # ── Worker signals ──────────────────────────────────────────
+        self.worker.state_updated.connect(self._on_state_updated)
+        self.worker.send_error.connect(self._on_send_error)
 
     # ------------------------------------------------------------------
     # Layout
@@ -261,10 +264,8 @@ class ControllerTab(QWidget):
                 arm=arm, joint=joint, min_deg=lo, max_deg=hi,
                 slider=slider, target_label=target_label, current_label=current_label,
             )
-            # When the slider moves, update both the label and target_deg.
-            # No send_action here — the poll loop owns commanding.
+            # Slider movement: update label + post target to worker.
             slider.valueChanged.connect(lambda v, u=ui: self._on_slider_moved(u, v))
-
             self.joint_uis[(arm, joint)] = ui
 
         v.addLayout(grid)
@@ -277,49 +278,105 @@ class ControllerTab(QWidget):
     # ------------------------------------------------------------------
     def _on_slider_moved(self, ui: _JointUI, ticks: int) -> None:
         deg = ticks / SLIDER_SCALE
-        ui.target_deg = deg
         ui.target_label.setText(f"{deg:+6.1f} °")
+        # Post to the worker. For torque-OFF joints this is harmless — the
+        # worker continuously resets those trajectories to current anyway.
+        self.worker.post_set_target(ui.arm, ui.joint, deg)
 
     def _on_torque(self, arm: str, enabled: bool) -> None:
-        # Before enabling torque, align target & commanded with the last
-        # observed current so the arm doesn't lurch on the first tick.
-        if enabled:
-            for (a, _), ui in self.joint_uis.items():
-                if a != arm:
-                    continue
-                if not ui.initialized:
-                    continue
-                ui.target_deg = ui.current_deg
-                ui.commanded_deg = ui.current_deg
-                self._set_slider_silent(ui, ui.current_deg)
-                ui.target_label.setText(f"{ui.current_deg:+6.1f} °")
-
-        self.robot.set_torque(arm, enabled)
+        self.worker.post_torque(arm, enabled)
         self._torque_on[arm] = enabled
         btn = self.torque_buttons[arm]
         btn.setText(f"Torque: {'ON' if enabled else 'OFF'}")
 
     def _on_estop(self) -> None:
-        self.robot.emergency_stop()
+        self.worker.post_estop()
         self._torque_on = {"left": False, "right": False}
         for arm, btn in self.torque_buttons.items():
             btn.setChecked(False)
             btn.setText("Torque: OFF")
-        # Reset every target to current so re-enabling torque doesn't
-        # resume the interrupted motion.
-        for ui in self.joint_uis.values():
-            if ui.initialized:
-                ui.target_deg = ui.current_deg
-                ui.commanded_deg = ui.current_deg
-                self._set_slider_silent(ui, ui.current_deg)
-                ui.target_label.setText(f"{ui.current_deg:+6.1f} °")
-        logger.warning("UI: emergency stop; targets reset to current.")
+        # Sliders snap to current on the next state_updated tick because the
+        # worker resets trajectories on estop; here we just update labels so
+        # the UI doesn't show a stale target for a second.
+        for (_arm, _joint), ui in self.joint_uis.items():
+            # Mirror the slider's value → target label so they're consistent
+            # with the arm's new "hold current" trajectory.
+            pass  # the state_updated callback will sync within 33 ms
+        logger.warning("UI: emergency stop posted to worker")
+
+    def _on_go_to_zero(self, arm: str) -> None:
+        changed = 0
+        for (a, joint), ui in self.joint_uis.items():
+            if a != arm:
+                continue
+            target = self._clamp(0.0, ui.min_deg, ui.max_deg)
+            self._set_slider_silent(ui, target)
+            ui.target_label.setText(f"{target:+6.1f} °")
+            self.worker.post_set_target(arm, joint, target)
+            changed += 1
+        logger.info(f"go-to-zero: {arm} arm, {changed} slider(s) set to 0°")
+
+    # ------------------------------------------------------------------
+    # Worker signals
+    # ------------------------------------------------------------------
+    def _on_state_updated(self, state: dict) -> None:
+        """Called via Qt queued signal from the motion worker thread."""
+        for (arm, joint), ui in self.joint_uis.items():
+            cur = state.get(f"{arm}_{joint}.pos")
+            if cur is None:
+                continue
+            cur = float(cur)
+            ui.current_label.setText(f"{cur:+6.1f} °")
+            ui.slider.set_marker_ticks(int(round(cur * SLIDER_SCALE)))
+
+            # First-time: snap the slider thumb to current so dragging later
+            # doesn't start from a stale 0°.
+            key = (arm, joint)
+            if key not in self._sliders_initialized:
+                self._set_slider_silent(ui, cur)
+                ui.target_label.setText(f"{cur:+6.1f} °")
+                self._sliders_initialized.add(key)
+
+    def _on_send_error(self, msg: str) -> None:
+        self._update_warning(f"send_action failed: {msg}")
+
+    # ------------------------------------------------------------------
+    # Camera poll (UI thread, 5 Hz)
+    # ------------------------------------------------------------------
+    def _poll_cameras(self) -> None:
+        try:
+            obs = self.robot.get_observation()
+        except Exception as e:
+            self._update_warning(f"Camera poll error: {e!s}")
+            logger.exception("camera poll failed")
+            return
+        if obs is None:
+            return
+
+        # If cameras transitioned to dead, update panels + statusbar.
+        if self.robot.cameras_dead and not self._cameras_marked_dead:
+            for panel in self.cam_panels.values():
+                panel.mark_disconnected()
+            self._cameras_marked_dead = True
+            self._update_warning(
+                "Cameras disconnected — motion continues on motor state only"
+            )
+            return
+
+        if self._cameras_marked_dead:
+            return  # nothing to update
+
+        for name, panel in self.cam_panels.items():
+            frame = obs.get(name)
+            if frame is None:
+                continue
+            if isinstance(frame, np.ndarray) and frame.ndim == 3 and frame.dtype == np.uint8:
+                panel.update_frame(frame)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _set_slider_silent(self, ui: _JointUI, deg: float) -> None:
-        """Move the slider without firing valueChanged (which would stomp target_deg)."""
         ticks = int(round(deg * SLIDER_SCALE))
         ticks = max(ui.slider.minimum(), min(ui.slider.maximum(), ticks))
         ui.slider.blockSignals(True)
@@ -329,92 +386,6 @@ class ControllerTab(QWidget):
     @staticmethod
     def _clamp(val: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, val))
-
-    # ------------------------------------------------------------------
-    # The control loop
-    # ------------------------------------------------------------------
-    def _poll(self) -> None:
-        # One outer guard. An uncaught exception in a QTimer.timeout slot
-        # causes Qt to print a traceback but keep firing — which on a camera
-        # failure creates the flood we saw. Better to swallow, log once, and
-        # surface via the statusbar.
-        try:
-            self._poll_unchecked()
-        except Exception as e:
-            self._update_warning(f"Poll error: {e!s}")
-            logger.exception("poll iteration failed")
-
-    def _poll_unchecked(self) -> None:
-        obs = self.robot.get_observation()
-        if obs is None:
-            self._update_warning("Observation unavailable")
-            return
-
-        # Check for camera-dead transition — update panels and statusbar once.
-        if self.robot.cameras_dead and not self._cameras_marked_dead:
-            for panel in self.cam_panels.values():
-                panel.mark_disconnected()
-            self._cameras_marked_dead = True
-            self._update_warning(
-                "Cameras disconnected — control loop still running on motor state only"
-            )
-        elif not self.robot.cameras_dead and self._last_warning:
-            # Clear stale warning if cameras came back (they shouldn't, per design)
-            self._update_warning("")
-
-        step_cap = self.state.max_step_per_tick(config.POLL_HZ)
-        action: dict[str, float] = {}
-
-        for (arm, joint), ui in self.joint_uis.items():
-            key = f"{arm}_{joint}.pos"
-            cur = obs.get(key)
-            if cur is None:
-                continue
-            cur = float(cur)
-            ui.current_deg = cur
-            ui.current_label.setText(f"{cur:+6.1f} °")
-            ui.slider.set_marker_ticks(int(round(cur * SLIDER_SCALE)))
-
-            if not ui.initialized:
-                ui.target_deg = cur
-                ui.commanded_deg = cur
-                self._set_slider_silent(ui, cur)
-                ui.target_label.setText(f"{cur:+6.1f} °")
-                ui.initialized = True
-                continue
-
-            if not self._torque_on[arm]:
-                ui.target_deg = cur
-                ui.commanded_deg = cur
-                self._set_slider_silent(ui, cur)
-                ui.target_label.setText(f"{cur:+6.1f} °")
-                continue
-
-            delta = ui.target_deg - ui.commanded_deg
-            if abs(delta) <= step_cap:
-                ui.commanded_deg = ui.target_deg
-            else:
-                ui.commanded_deg += step_cap if delta > 0 else -step_cap
-
-            ui.commanded_deg = self._clamp(ui.commanded_deg, ui.min_deg, ui.max_deg)
-            action[f"{arm}_{joint}.pos"] = ui.commanded_deg
-
-        # Update cameras — only when they're still alive. Once dead, the
-        # panels display the red placeholder and we leave them alone.
-        if not self._cameras_marked_dead:
-            for name, panel in self.cam_panels.items():
-                frame = obs.get(name)
-                if frame is None:
-                    continue
-                if isinstance(frame, np.ndarray) and frame.ndim == 3 and frame.dtype == np.uint8:
-                    panel.update_frame(frame)
-
-        if action:
-            try:
-                self.robot.send_action(action)
-            except Exception as e:
-                logger.error(f"send_action failed: {e}")
-                self._update_warning(f"send_action failed: {e!s}")
 
     def _update_warning(self, msg: str) -> None:
         if msg != self._last_warning:

@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
 
 from . import config
 from .key_bindings import load_bindings
+from .motion_worker import MotionWorker
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 from .tab_controller import ControllerTab
@@ -33,15 +34,21 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, robot: RobotService, state: RuntimeState) -> None:
+    def __init__(
+        self,
+        robot: RobotService,
+        state: RuntimeState,
+        worker: MotionWorker,
+    ) -> None:
         super().__init__()
         self.robot = robot
         self.state = state
+        self.worker = worker
         self.setWindowTitle("OpenArm Controller (LeRobot direct)")
         self.resize(1200, 800)
 
         tabs = QTabWidget()
-        self.controller_tab = ControllerTab(robot, state)
+        self.controller_tab = ControllerTab(robot, state, worker)
         self.system_tab = SystemTab(robot, state)
         tabs.addTab(self.controller_tab, "Controller")
         tabs.addTab(self.system_tab, "System")
@@ -65,6 +72,9 @@ class MainWindow(QMainWindow):
         self._connection_label.setText(text)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        logger.info("Window close: stopping motion worker…")
+        self.worker.stop()
+        self.worker.wait(2000)  # 2 s to let current tick drain
         logger.info("Window close: disconnecting robot…")
         self.robot.disconnect()
         super().closeEvent(event)
@@ -103,7 +113,9 @@ def main() -> int:
         return 2
 
     state = RuntimeState()
-    window = MainWindow(robot, state)
+    worker = MotionWorker(robot, state)
+    worker.start()
+    window = MainWindow(robot, state, worker)
     window.show()
     return app.exec_()
 

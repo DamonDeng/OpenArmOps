@@ -7,31 +7,47 @@ for bring-up, calibration, and exploration.
 
 ## Status
 
-**M3 — sliders command the arm (ramped control loop, in testing).**
+**M3-v2 — two-thread motion control (in testing).**
 
-Each poll tick (5 Hz):
+After M3's first version, we hit two problems: the closed-loop ramp stalled
+on loaded joints (gripper under load was commanded from current, so error
+stayed tiny and torque didn't grow), and the open-loop version tripped
+LeRobot's `max_relative_target` safety cap.
 
-1. Read observation; update every joint's `current`.
-2. For each joint on a torque-ON arm, step its `commanded` toward its
-   `target` (= slider position) by at most `max_speed / 5` degrees.
-3. Send one `send_action(dict)` with the new commanded values for every
-   torque-ON joint.
-4. For torque-OFF arms, keep target and commanded synced with current so
-   enabling torque later won't lurch.
+The new architecture cleanly separates time from motor tracking:
 
-**Three values per joint** — slider (target, user), commanded (what we
-send each tick), current (motor reads back). Each slider paints an amber
-tick mark at the current position so you can watch it chase the thumb.
+- **MotionWorker** — dedicated QThread at 30 Hz. Owns a `JointTrajectory`
+  per joint. Each tick: drain command queue, read motor state, advance
+  every trajectory one tick (`setpoint = start + elapsed * deg_per_tick`),
+  send one MIT batch per arm.
+- **UI thread** — 5 Hz camera-only polling. Slider / keyboard / button
+  events post commands into the worker's queue. Worker emits
+  `state_updated` every tick; the tab updates "cur:" labels and amber
+  markers in that slot.
 
-- **Max commanded speed** is a global setting on the System tab (default
-  5 °/s; range 0.1–120 °/s). Changes take effect on the next poll tick.
-- **Emergency stop** now also resets every target to its current position,
-  so toggling torque back on doesn't resume an interrupted motion.
-- **Enabling torque** on an arm first aligns target & commanded with the
-  last observed current, so the arm doesn't jump when torque engages.
+Key mechanics:
+
+- Setpoint grows linearly in wall-clock time at `max_speed_deg_per_sec`
+  regardless of whether the motor is keeping up. If the motor lags, the
+  MIT error (`setpoint - current`) grows → torque grows → motor moves.
+  Naturally handles loaded joints without stalling.
+- **Lead cap** (`LEAD_CAP_DEG=10°`): if setpoint would be more than 10°
+  ahead of current, we pause the trajectory's time for that tick and
+  clamp the setpoint. Prevents runaway on a jammed joint.
+- Torque-OFF arms: their trajectories are continuously reset to
+  `start=target=current`, so re-enabling torque is lurch-free.
+- E-stop / torque-off / go-to-zero all post commands to the worker
+  rather than touching state directly.
 
 Upcoming: keyboard shortcuts + reloadable bindings (M4), motor info
 display + editable kp/kd (M5 / v3).
+
+**Known TODO carried forward**
+
+- BiOpenArmFollower's `connect()` calls `set_zero_position()` every time,
+  so the motor zeros reset to whatever pose the arm is in at startup.
+  We should suppress that call to preserve the last calibration across
+  app restarts. Deferred.
 
 ## Prerequisites
 

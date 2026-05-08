@@ -38,15 +38,24 @@ ARM_SIDES = ["right", "left"]
 MAX_RELATIVE_TARGET_DEG = 3.0  # per send_action, hard cap enforced by LeRobot
 USE_FULL_LIMITS = True  # True ⇒ per-side ranges (75°/135°/etc), False ⇒ ±5° safety defaults
 
-# UI polling
-POLL_HZ = 5  # rate for reading observations (state + cameras)
-SEND_MAX_HZ = 5  # rate limit for send_action while dragging sliders
+# UI polling (cameras + state display). The motor control loop runs at a
+# higher rate in a dedicated worker thread — see MOTION_HZ below.
+POLL_HZ = 5  # rate for reading observations on the UI thread (cameras + state)
 
-# Initial cap on commanded joint velocity. Every poll tick the per-joint
-# commanded value moves toward the slider target by at most
-# MAX_SPEED_DEG_PER_SEC / POLL_HZ degrees. Runtime-editable from the
-# System tab — this constant only seeds the spinbox on startup.
+# Motion control loop rate. Runs in a worker thread with a self-scheduled
+# sleep based on time.perf_counter() so it's ~accurate independent of Qt.
+MOTION_HZ = 30
+
+# Initial cap on commanded joint velocity. The motion worker advances each
+# joint's setpoint at this rate, regardless of whether the motor is keeping
+# up (the lead cap below handles lag). Runtime-editable from System tab.
 INITIAL_MAX_SPEED_DEG_PER_SEC = 5.0
+
+# Lead cap (degrees). If setpoint would be more than LEAD_CAP degrees ahead
+# of the motor's observed current, we pause the trajectory until the motor
+# catches up. Prevents runaway when a joint stalls (gripper jammed, arm
+# hitting something) and bounds the error seen by MIT control.
+LEAD_CAP_DEG = 10.0
 
 # Per-keystroke deltas (degrees). Shift = coarse, Ctrl = fine.
 KEY_DELTA_DEFAULT = 1.0
