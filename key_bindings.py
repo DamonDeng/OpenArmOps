@@ -17,8 +17,12 @@ from pathlib import Path
 from . import config
 
 
-# Currently supported modifiers. "none" = plain keypress. "shift" = Shift held.
-ALLOWED_MODIFIERS = ("none", "shift")
+# Currently supported modifiers. Exactly one of these describes the state of
+# the user's modifier keys at keypress time. "none" = no modifier held;
+# otherwise exactly one of shift/ctrl/alt is held. Multi-modifier combos
+# (e.g. Ctrl+Shift) are intentionally not supported — the keyboard filter
+# ignores them rather than guessing which layer was intended.
+ALLOWED_MODIFIERS = ("none", "shift", "ctrl", "alt")
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,5 @@
 {
-  "_comment": "Maps (key, modifier) → (arm, joint, direction). `key` is a single character (case-insensitive). `modifier` is 'none' or 'shift'. direction is +1 or -1 and is the per-keypress target offset in degrees. Same key can appear twice with different modifiers for a 'layer 2' binding.",
+  "_comment": "Maps (key, modifier) → (arm, joint, direction). `key` is a single character (case-insensitive). `modifier` is 'none', 'shift', 'ctrl', or 'alt'. direction is +1 or -1 (degrees per keypress). Multi-modifier combos (e.g. Ctrl+Shift) are not supported — the filter ignores them. Layer map per arm: none=j1/j2, shift=j4/j3, ctrl=j7/j5, alt=gripper/j6. Keys e/d/i/k drive the first joint in each layer (typing-row keys); s/f/l/j drive the second (resting-row keys).",
   "bindings": [
     {"key": "e", "modifier": "none",  "arm": "left",  "joint": "joint_1", "direction": -1, "note": "left arm forward"},
     {"key": "d", "modifier": "none",  "arm": "left",  "joint": "joint_1", "direction":  1, "note": "left arm backward"},
@@ -17,6 +17,24 @@
     {"key": "i", "modifier": "shift", "arm": "right", "joint": "joint_4", "direction":  1, "note": "right elbow fold"},
     {"key": "k", "modifier": "shift", "arm": "right", "joint": "joint_4", "direction": -1, "note": "right elbow unfold"},
     {"key": "l", "modifier": "shift", "arm": "right", "joint": "joint_3", "direction":  1, "note": "right upper arm outward"},
-    {"key": "j", "modifier": "shift", "arm": "right", "joint": "joint_3", "direction": -1, "note": "right upper arm inward"}
+    {"key": "j", "modifier": "shift", "arm": "right", "joint": "joint_3", "direction": -1, "note": "right upper arm inward"},
+
+    {"key": "e", "modifier": "ctrl",  "arm": "left",  "joint": "joint_7", "direction": -1, "note": "left wrist yaw forward"},
+    {"key": "d", "modifier": "ctrl",  "arm": "left",  "joint": "joint_7", "direction":  1, "note": "left wrist yaw backward"},
+    {"key": "s", "modifier": "ctrl",  "arm": "left",  "joint": "joint_5", "direction": -1, "note": "left wrist roll outward"},
+    {"key": "f", "modifier": "ctrl",  "arm": "left",  "joint": "joint_5", "direction":  1, "note": "left wrist roll inward"},
+    {"key": "i", "modifier": "ctrl",  "arm": "right", "joint": "joint_7", "direction":  1, "note": "right wrist yaw forward"},
+    {"key": "k", "modifier": "ctrl",  "arm": "right", "joint": "joint_7", "direction": -1, "note": "right wrist yaw backward"},
+    {"key": "l", "modifier": "ctrl",  "arm": "right", "joint": "joint_5", "direction":  1, "note": "right wrist roll outward"},
+    {"key": "j", "modifier": "ctrl",  "arm": "right", "joint": "joint_5", "direction": -1, "note": "right wrist roll inward"},
+
+    {"key": "e", "modifier": "alt",   "arm": "left",  "joint": "gripper", "direction": -1, "note": "left gripper open (toward -65)"},
+    {"key": "d", "modifier": "alt",   "arm": "left",  "joint": "gripper", "direction":  1, "note": "left gripper close (toward 0)"},
+    {"key": "s", "modifier": "alt",   "arm": "left",  "joint": "joint_6", "direction":  1, "note": "left wrist pitch outward"},
+    {"key": "f", "modifier": "alt",   "arm": "left",  "joint": "joint_6", "direction": -1, "note": "left wrist pitch inward"},
+    {"key": "i", "modifier": "alt",   "arm": "right", "joint": "gripper", "direction": -1, "note": "right gripper open"},
+    {"key": "k", "modifier": "alt",   "arm": "right", "joint": "gripper", "direction":  1, "note": "right gripper close"},
+    {"key": "l", "modifier": "alt",   "arm": "right", "joint": "joint_6", "direction": -1, "note": "right wrist pitch outward"},
+    {"key": "j", "modifier": "alt",   "arm": "right", "joint": "joint_6", "direction":  1, "note": "right wrist pitch inward"}
   ]
 }

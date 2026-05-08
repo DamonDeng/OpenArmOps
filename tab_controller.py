@@ -166,10 +166,28 @@ class _KeyboardFilter(QObject):
             return False
         ke: QKeyEvent = event  # type: ignore[assignment]
 
+        # Debug-only: verify what Qt is handing us. Uses Qt's key code rather
+        # than text() because Ctrl+letter sometimes produces empty text() on
+        # some platforms (the OS intercepts the text-producing step).
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"KeyPress key=0x{ke.key():X} text={ke.text()!r} "
+                f"mods=0x{int(ke.modifiers()):X} obj={type(obj).__name__}"
+            )
+
         text = ke.text()
-        if not text:
-            return False
-        ch = text[0].lower()
+        ch = text[0].lower() if text else ""
+
+        # Ctrl+letter often arrives with an empty/control text on Linux
+        # (the X server's keysym processing strips the printable char).
+        # Fall back to Qt's key code: Qt.Key_A == 0x41, case-independent.
+        if not ch or not ch.isalpha():
+            k = ke.key()
+            # Accept only the A-Z range we actually bind.
+            if Qt.Key_A <= k <= Qt.Key_Z:
+                ch = chr(ord("a") + (k - Qt.Key_A))
+            else:
+                return False
 
         # If focus is on a text-entry widget (e.g. a spinbox), don't steal
         # the key — the user is probably editing a number. A cheap check:
@@ -182,11 +200,23 @@ class _KeyboardFilter(QObject):
             if isinstance(fw, (QAbstractSpinBox, QLineEdit)):
                 return False
 
-        # Map Qt's modifier flags to our string modifier. We support Shift
-        # as a layer selector; other modifiers fall through to 'none' so
-        # future layers can be added later without breaking existing keys.
-        if ke.modifiers() & Qt.ShiftModifier:
+        # Map Qt's modifier flags to our string modifier. Exactly one of
+        # shift/ctrl/alt may be held; any combination (or any other
+        # modifier such as Meta/Super) produces "ignore" so the user's
+        # intent stays unambiguous.
+        mods = ke.modifiers()
+        shift = bool(mods & Qt.ShiftModifier)
+        ctrl = bool(mods & Qt.ControlModifier)
+        alt = bool(mods & Qt.AltModifier)
+        held = int(shift) + int(ctrl) + int(alt)
+        if held > 1:
+            return False
+        if shift:
             modifier = "shift"
+        elif ctrl:
+            modifier = "ctrl"
+        elif alt:
+            modifier = "alt"
         else:
             modifier = "none"
 
