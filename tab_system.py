@@ -111,6 +111,16 @@ class SystemTab(QWidget):
         self.speed_spin.setValue(self.state.max_speed_deg_per_sec)
         self.speed_spin.valueChanged.connect(self._on_speed_changed)
         speed_form.addRow("Max commanded speed:", self.speed_spin)
+
+        self.gcomp_spin = QDoubleSpinBox()
+        self.gcomp_spin.setDecimals(2)
+        self.gcomp_spin.setRange(uiconfig.GRAVITY_COMP_SCALE_MIN,
+                                 uiconfig.GRAVITY_COMP_SCALE_MAX)
+        self.gcomp_spin.setSingleStep(uiconfig.GRAVITY_COMP_SCALE_STEP)
+        self.gcomp_spin.setValue(self.state.gravity_comp_scale)
+        self.gcomp_spin.valueChanged.connect(self._on_gravity_comp_changed)
+        speed_form.addRow("Gravity comp scale:", self.gcomp_spin)
+
         root.addWidget(speed_box)
 
         # ── Motor info ─────────────────────────────────────────────
@@ -220,6 +230,10 @@ class SystemTab(QWidget):
         self.state.max_speed_deg_per_sec = float(value)
         logger.info(f"max commanded speed set to {value:.1f} °/s")
 
+    def _on_gravity_comp_changed(self, value: float) -> None:
+        self.state.gravity_comp_scale = float(value)
+        logger.info(f"gravity comp scale set to {value:.2f}")
+
     # ------------------------------------------------------------------
     # Motor info
     # ------------------------------------------------------------------
@@ -290,6 +304,15 @@ class SystemTab(QWidget):
         return box
 
     def _refresh_motor_info(self) -> None:
+        # Sync the gravity-comp spinbox in case the motion worker reset the
+        # scale (e.g. on e-stop) while this tab was invisible. Cheap and
+        # idempotent — setValue is a no-op when the value already matches.
+        cur_scale = float(self.state.gravity_comp_scale)
+        if abs(cur_scale - self.gcomp_spin.value()) > 1e-6:
+            self.gcomp_spin.blockSignals(True)
+            self.gcomp_spin.setValue(cur_scale)
+            self.gcomp_spin.blockSignals(False)
+
         stats = self.robot.get_motor_stats()
         if stats is None:
             return

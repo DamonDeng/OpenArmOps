@@ -34,6 +34,7 @@ from typing import Optional
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from . import config
+from .gravity_comp import GravityCompensator
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 
@@ -122,6 +123,11 @@ class MotionWorker(QThread):
         self._last_current: dict[str, float] = {}
         self._initialized = False  # True once we have a first observation
 
+        # Gravity compensation — loaded lazily in run() so startup doesn't
+        # fail if the URDF is missing. Either both are set or both are None.
+        self._gc_left: GravityCompensator | None = None
+        self._gc_right: GravityCompensator | None = None
+
     # ------------------------------------------------------------------
     # UI-facing API — these only post to the queue, they don't touch state.
     # ------------------------------------------------------------------
@@ -161,6 +167,24 @@ class MotionWorker(QThread):
     def run(self) -> None:
         period = 1.0 / config.MOTION_HZ
         logger.info(f"MotionWorker started at {config.MOTION_HZ} Hz (period {period*1000:.1f} ms)")
+
+        # Load gravity compensation models. Both instances use the same
+        # bimanual URDF; each picks its own 7 joints by name (arm_side arg).
+        try:
+            urdf = str(config.GRAVITY_URDF_PATH)
+            self._gc_left = GravityCompensator(urdf, arm_side="left")
+            self._gc_right = GravityCompensator(urdf, arm_side="right")
+            logger.info(
+                f"Gravity comp loaded from {urdf} "
+                f"(initial scale={self.runtime.gravity_comp_scale})"
+            )
+        except Exception as e:
+            self._gc_left = None
+            self._gc_right = None
+            logger.error(
+                f"Gravity comp disabled (URDF load failed): {e}. "
+                "Setpoints will be sent with tau_ff=0."
+            )
 
         next_tick = time.perf_counter()
         while not self._stop_flag:
@@ -238,12 +262,75 @@ class MotionWorker(QThread):
         # 5. Publish state to UI (thread-safe Qt signal)
         self.state_updated.emit(dict(current))
 
-        # 6. Send one action batch
+        # 6. Send one MIT batch per arm, folding in gravity comp torques.
+        # We bypass robot.send_action() because it hardcodes tau_ff=0 and
+        # we want the Damiao MIT packet's torque feedforward slot.
         if action:
+            self._send_mit_batches(action, current)
+
+    def _send_mit_batches(
+        self,
+        action: dict[str, float],
+        current: dict[str, float],
+    ) -> None:
+        """Split the per-joint action dict by arm, compute gravity comp
+        torques per arm, and send one MIT batch per arm through the
+        robot service.
+        """
+        scale = float(self.runtime.gravity_comp_scale)
+
+        for arm, gc in (("left", self._gc_left), ("right", self._gc_right)):
+            # Collect this arm's actions (joint_name -> pos_deg).
+            arm_prefix = f"{arm}_"
+            arm_action: dict[str, float] = {}
+            for key, pos in action.items():
+                if key.startswith(arm_prefix):
+                    # Strip "{arm}_" and ".pos" to get bare motor name
+                    motor = key[len(arm_prefix):].removesuffix(".pos")
+                    arm_action[motor] = pos
+            if not arm_action:
+                continue
+
+            cfg = self.robot.arm_config_snapshot(arm)
+            if cfg is None:
+                continue
+            kp_list = cfg["position_kp"]
+            kd_list = cfg["position_kd"]
+
+            # Compute gravity torques in the same joint order (j1..j7).
+            tau_ff = [0.0] * 8  # index 7 (gripper) stays 0
+            if gc is not None and scale != 0.0:
+                pos_deg_7 = [
+                    current.get(f"{arm}_joint_{i+1}.pos", 0.0) for i in range(7)
+                ]
+                try:
+                    raw = gc.compute_tau_gravity(pos_deg_7)
+                    for i in range(7):
+                        tau_ff[i] = raw[i] * scale
+                except Exception as e:
+                    logger.error(f"gravity comp failed for {arm} arm: {e}")
+
+            # Build the MIT command dict in the shape _mit_control_batch wants.
+            motor_order = config.JOINT_NAMES  # joint_1..joint_7, gripper
+            commands: dict[str, tuple[float, float, float, float, float]] = {}
+            for i, motor in enumerate(motor_order):
+                if motor not in arm_action:
+                    continue
+                kp = kp_list[i] if isinstance(kp_list, list) else kp_list
+                kd = kd_list[i] if isinstance(kd_list, list) else kd_list
+                commands[motor] = (
+                    kp, kd,
+                    arm_action[motor],
+                    0.0,              # velocity feedforward unused
+                    tau_ff[i],
+                )
+
+            if not commands:
+                continue
             try:
-                self.robot.send_action(action)
+                self.robot.send_mit_batch(arm, commands)
             except Exception as e:
-                logger.error(f"send_action failed: {e}")
+                logger.error(f"send_mit_batch failed for {arm} arm: {e}")
                 self.send_error.emit(str(e))
 
     # ------------------------------------------------------------------
@@ -307,7 +394,14 @@ class MotionWorker(QThread):
                         deg_per_sec=self.runtime.max_speed_deg_per_sec,
                         hz=config.MOTION_HZ,
                     )
-                logger.warning("motion worker: e-stop consumed; torque off; trajectories pinned")
+                # Extra safety: zero gravity-comp scale so re-enabling torque
+                # leaves the motors fully passive until the user deliberately
+                # dials it back up from the System tab.
+                self.runtime.gravity_comp_scale = 0.0
+                logger.warning(
+                    "motion worker: e-stop consumed; torque off; trajectories pinned; "
+                    "gravity_comp_scale reset to 0"
+                )
 
     def _read_state(self) -> Optional[dict[str, float]]:
         """Read motor positions only. Cameras are read by the UI thread."""

@@ -7,6 +7,8 @@ per-keystroke deltas) live in ``key_bindings.json`` and are loaded by
 
 from pathlib import Path
 
+PACKAGE_DIR = Path(__file__).parent
+
 # CAN interfaces — match lerobot_controller/server.py and run_folding_direct.py
 CAN_RIGHT = "can0"
 CAN_LEFT = "can1"
@@ -69,6 +71,23 @@ UNFOLD_ARM_POSE = {
               "joint_5": 0.0, "joint_6":   0.0, "joint_7": 0.0, "gripper": 0.0},
 }
 
+# ── Gravity compensation ──────────────────────────────────────────────
+# Pinocchio-based feedforward torques. The URDF and a local copy of
+# GravityCompensator were lifted from lerobot_controller/ — kept self-
+# contained so this package has no runtime dependency on that server.
+GRAVITY_URDF_PATH = PACKAGE_DIR / "urdf" / "openarm_bimanual.urdf"
+
+# Initial scale factor for gravity compensation torques. 0.0 = off,
+# 1.0 = model-predicted torque, >1.0 = overcompensate (useful when the
+# URDF mass params underestimate your actual arm). Editable at runtime
+# via the System-tab spinbox.
+INITIAL_GRAVITY_COMP_SCALE = 0.5
+
+# Spinbox range / step for the System-tab control.
+GRAVITY_COMP_SCALE_MIN = 0.0
+GRAVITY_COMP_SCALE_MAX = 2.0
+GRAVITY_COMP_SCALE_STEP = 0.05
+
 # Lead cap (degrees). If setpoint would be more than LEAD_CAP degrees ahead
 # of the motor's observed current, we pause the trajectory until the motor
 # catches up. Prevents runaway when a joint stalls (gripper jammed, arm
@@ -81,5 +100,4 @@ KEY_DELTA_SHIFT = 3.0  # matches MAX_RELATIVE_TARGET_DEG to avoid silent clippin
 KEY_DELTA_CTRL = 0.2
 
 # Key bindings config file — loaded at startup, reloadable via UI
-PACKAGE_DIR = Path(__file__).parent
 DEFAULT_KEY_BINDINGS_PATH = PACKAGE_DIR / "key_bindings.json"

@@ -244,6 +244,22 @@ class RobotService:
     def cameras_dead(self) -> bool:
         return self._cameras_dead
 
+    def arm_config_snapshot(self, arm: str) -> dict | None:
+        """Return a copy of the kp/kd/joint_limits the worker needs for MIT
+        batches. Returned dict is safe to use without holding the lock.
+        """
+        with self._lock:
+            if not self._connected or self._robot is None:
+                return None
+            src = self._robot.left_arm.config if arm == "left" else self._robot.right_arm.config
+            return {
+                "position_kp": list(src.position_kp)
+                if isinstance(src.position_kp, list) else src.position_kp,
+                "position_kd": list(src.position_kd)
+                if isinstance(src.position_kd, list) else src.position_kd,
+                "joint_limits": dict(src.joint_limits),
+            }
+
     def get_motor_stats(self) -> dict | None:
         """Return the Damiao bus's cached motor stats, keyed by '{arm}_{joint}'.
 
@@ -275,3 +291,22 @@ class RobotService:
             if not self._connected or self._robot is None:
                 return
             self._robot.send_action(action)
+
+    def send_mit_batch(
+        self,
+        arm: str,
+        commands: dict[str, tuple[float, float, float, float, float]],
+    ) -> None:
+        """Send a direct MIT-control batch, bypassing send_action.
+
+        Use this when you need to pass a non-zero feedforward torque —
+        LeRobot's send_action hardcodes torque=0. The command tuple per
+        motor is ``(kp, kd, position_deg, velocity_deg_per_sec, torque_ff_Nm)``.
+        Joint-limit clipping and kp/kd selection are the caller's
+        responsibility — this wrapper just forwards to the bus.
+        """
+        with self._lock:
+            if not self._connected or self._robot is None:
+                return
+            target_arm = self._robot.left_arm if arm == "left" else self._robot.right_arm
+            target_arm.bus._mit_control_batch(commands)

@@ -15,6 +15,7 @@ from . import config
 @dataclass
 class RuntimeState:
     max_speed_deg_per_sec: float = config.INITIAL_MAX_SPEED_DEG_PER_SEC
+    gravity_comp_scale: float = config.INITIAL_GRAVITY_COMP_SCALE
 
     def max_step_per_tick(self, poll_hz: int = config.POLL_HZ) -> float:
         """Max degrees the commanded value can move per poll tick."""
