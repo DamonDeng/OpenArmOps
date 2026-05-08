@@ -49,7 +49,10 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         self.controller_tab = ControllerTab(robot, state, worker)
-        self.system_tab = SystemTab(robot, state)
+        # System tab gets a reference to the controller tab so its
+        # "Reload key bindings" button can reach into ControllerTab's
+        # bindings dict. Small coupling; acceptable for a two-tab app.
+        self.system_tab = SystemTab(robot, state, self.controller_tab)
         tabs.addTab(self.controller_tab, "Controller")
         tabs.addTab(self.system_tab, "System")
         self.setCentralWidget(tabs)

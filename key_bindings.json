@@ -1,13 +1,22 @@
 {
-  "_comment": "Maps keyboard keys → (arm_side, joint_name, direction). direction is +1 or -1 and is multiplied by the active delta (default / shift=coarse / ctrl=fine) to produce a per-keypress target offset. Keys must be single characters; case-insensitive; Shift/Ctrl modifiers are applied automatically at runtime, do NOT include them here.",
+  "_comment": "Maps (key, modifier) → (arm, joint, direction). `key` is a single character (case-insensitive). `modifier` is 'none' or 'shift'. direction is +1 or -1 and is the per-keypress target offset in degrees. Same key can appear twice with different modifiers for a 'layer 2' binding.",
   "bindings": [
-    {"key": "s", "arm": "left",  "joint": "joint_1", "direction": -1, "note": "left j1 negative"},
-    {"key": "f", "arm": "left",  "joint": "joint_1", "direction":  1, "note": "left j1 positive"},
-    {"key": "e", "arm": "left",  "joint": "joint_2", "direction":  1, "note": "left j2 positive"},
-    {"key": "d", "arm": "left",  "joint": "joint_2", "direction": -1, "note": "left j2 negative"},
-    {"key": "j", "arm": "right", "joint": "joint_1", "direction": -1, "note": "right j1 negative"},
-    {"key": "l", "arm": "right", "joint": "joint_1", "direction":  1, "note": "right j1 positive"},
-    {"key": "i", "arm": "right", "joint": "joint_2", "direction":  1, "note": "right j2 positive"},
-    {"key": "k", "arm": "right", "joint": "joint_2", "direction": -1, "note": "right j2 negative"}
+    {"key": "e", "modifier": "none",  "arm": "left",  "joint": "joint_1", "direction": -1, "note": "left arm forward"},
+    {"key": "d", "modifier": "none",  "arm": "left",  "joint": "joint_1", "direction":  1, "note": "left arm backward"},
+    {"key": "s", "modifier": "none",  "arm": "left",  "joint": "joint_2", "direction": -1, "note": "left arm outward"},
+    {"key": "f", "modifier": "none",  "arm": "left",  "joint": "joint_2", "direction":  1, "note": "left arm inward"},
+    {"key": "i", "modifier": "none",  "arm": "right", "joint": "joint_1", "direction":  1, "note": "right arm forward"},
+    {"key": "k", "modifier": "none",  "arm": "right", "joint": "joint_1", "direction": -1, "note": "right arm backward"},
+    {"key": "l", "modifier": "none",  "arm": "right", "joint": "joint_2", "direction":  1, "note": "right arm outward"},
+    {"key": "j", "modifier": "none",  "arm": "right", "joint": "joint_2", "direction": -1, "note": "right arm inward"},
+
+    {"key": "e", "modifier": "shift", "arm": "left",  "joint": "joint_4", "direction":  1, "note": "left elbow fold"},
+    {"key": "d", "modifier": "shift", "arm": "left",  "joint": "joint_4", "direction": -1, "note": "left elbow unfold"},
+    {"key": "s", "modifier": "shift", "arm": "left",  "joint": "joint_3", "direction": -1, "note": "left upper arm outward"},
+    {"key": "f", "modifier": "shift", "arm": "left",  "joint": "joint_3", "direction":  1, "note": "left upper arm inward"},
+    {"key": "i", "modifier": "shift", "arm": "right", "joint": "joint_4", "direction":  1, "note": "right elbow fold"},
+    {"key": "k", "modifier": "shift", "arm": "right", "joint": "joint_4", "direction": -1, "note": "right elbow unfold"},
+    {"key": "l", "modifier": "shift", "arm": "right", "joint": "joint_3", "direction":  1, "note": "right upper arm outward"},
+    {"key": "j", "modifier": "shift", "arm": "right", "joint": "joint_3", "direction": -1, "note": "right upper arm inward"}
   ]
 }

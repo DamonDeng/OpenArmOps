@@ -94,10 +94,12 @@ GRAVITY_COMP_SCALE_STEP = 0.05
 # hitting something) and bounds the error seen by MIT control.
 LEAD_CAP_DEG = 10.0
 
-# Per-keystroke deltas (degrees). Shift = coarse, Ctrl = fine.
+# Per-keypress target nudge in degrees. Shift is used as a layer selector
+# (shoulder vs elbow/rotation), not as a coarse-speed modifier; every
+# nudge is the same size. Hold a key → OS key-repeat advances the target
+# at ~30×this per second; the motion worker's max_speed_deg_per_sec cap
+# is what ultimately gates motor velocity.
 KEY_DELTA_DEFAULT = 1.0
-KEY_DELTA_SHIFT = 3.0  # matches MAX_RELATIVE_TARGET_DEG to avoid silent clipping
-KEY_DELTA_CTRL = 0.2
 
 # Key bindings config file — loaded at startup, reloadable via UI
 DEFAULT_KEY_BINDINGS_PATH = PACKAGE_DIR / "key_bindings.json"

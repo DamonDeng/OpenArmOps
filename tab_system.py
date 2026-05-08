@@ -39,6 +39,13 @@ from . import config as uiconfig
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 
+# TYPE_CHECKING-only import to break a circular-import cycle: ControllerTab
+# imports from tab_system -> tab_system would import ControllerTab back. At
+# runtime the parameter is annotated as a forward-reference string.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .tab_controller import ControllerTab
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,11 +86,13 @@ class SystemTab(QWidget):
         self,
         robot: RobotService,
         state: RuntimeState,
+        controller_tab: "ControllerTab",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.robot = robot
         self.state = state
+        self.controller_tab = controller_tab
         self._thread: QThread | None = None
         self._worker: _CalibWorker | None = None
 
@@ -122,6 +131,20 @@ class SystemTab(QWidget):
         speed_form.addRow("Gravity comp scale:", self.gcomp_spin)
 
         root.addWidget(speed_box)
+
+        # ── Key bindings ───────────────────────────────────────────
+        kb_box = QGroupBox("Key bindings")
+        kb_layout = QVBoxLayout(kb_box)
+        kb_btn_row = QHBoxLayout()
+        self.btn_reload_bindings = QPushButton("Reload key bindings")
+        self.btn_reload_bindings.clicked.connect(self._on_reload_bindings)
+        kb_btn_row.addWidget(self.btn_reload_bindings)
+        kb_btn_row.addStretch(1)
+        kb_layout.addLayout(kb_btn_row)
+        self.kb_status = QLabel("")
+        self.kb_status.setStyleSheet("color: #484;")
+        kb_layout.addWidget(self.kb_status)
+        root.addWidget(kb_box)
 
         # ── Motor info ─────────────────────────────────────────────
         motor_box = QGroupBox("Motor info (updated at 2 Hz)")
@@ -233,6 +256,14 @@ class SystemTab(QWidget):
     def _on_gravity_comp_changed(self, value: float) -> None:
         self.state.gravity_comp_scale = float(value)
         logger.info(f"gravity comp scale set to {value:.2f}")
+
+    def _on_reload_bindings(self) -> None:
+        ok, msg = self.controller_tab.reload_bindings()
+        self.kb_status.setText(msg)
+        if ok:
+            self.kb_status.setStyleSheet("color: #484;")
+        else:
+            self.kb_status.setStyleSheet("color: #c44;")
 
     # ------------------------------------------------------------------
     # Motor info

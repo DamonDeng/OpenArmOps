@@ -18,9 +18,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QKeyEvent, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -40,6 +42,7 @@ from lerobot.robots.openarm_follower.config_openarm_follower import (
 )
 
 from . import config
+from .key_bindings import Binding, load_bindings
 from .motion_worker import MotionWorker
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
@@ -147,6 +150,54 @@ def _limits_for(arm: str, joint: str) -> tuple[float, float]:
     return src[joint]
 
 
+class _KeyboardFilter(QObject):
+    """Application-level event filter that converts key presses into target
+    nudges. Active only when the user's master toggle is on.
+    """
+
+    def __init__(self, tab: "ControllerTab") -> None:
+        super().__init__()
+        self.tab = tab
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() != QEvent.KeyPress:
+            return False
+        if not self.tab.keyboard_enabled:
+            return False
+        ke: QKeyEvent = event  # type: ignore[assignment]
+
+        text = ke.text()
+        if not text:
+            return False
+        ch = text[0].lower()
+
+        # If focus is on a text-entry widget (e.g. a spinbox), don't steal
+        # the key — the user is probably editing a number. A cheap check:
+        # the widget accepts text input if it is QAbstractSpinBox / QLineEdit.
+        # We lean on the widget's own signaling by checking focusWidget.
+        fw = QApplication.focusWidget()
+        if fw is not None:
+            # QAbstractSpinBox and QLineEdit both consume text keys normally.
+            from PyQt5.QtWidgets import QAbstractSpinBox, QLineEdit
+            if isinstance(fw, (QAbstractSpinBox, QLineEdit)):
+                return False
+
+        # Map Qt's modifier flags to our string modifier. We support Shift
+        # as a layer selector; other modifiers fall through to 'none' so
+        # future layers can be added later without breaking existing keys.
+        if ke.modifiers() & Qt.ShiftModifier:
+            modifier = "shift"
+        else:
+            modifier = "none"
+
+        binding = self.tab.bindings.get((ch, modifier))
+        if binding is None:
+            return False
+
+        self.tab._apply_key_nudge(binding)
+        return True  # consume
+
+
 class ControllerTab(QWidget):
     warning_changed = pyqtSignal(str)
 
@@ -168,6 +219,17 @@ class ControllerTab(QWidget):
         # they don't show 0° before the worker publishes state.
         self._sliders_initialized: set[tuple[str, str]] = set()
 
+        # Keyboard bindings — reloadable at runtime via the System-tab
+        # button. Default to the bindings file loaded at startup; if that
+        # failed we fall through with an empty dict (the filter just
+        # returns False for every key).
+        try:
+            self.bindings: dict[str, Binding] = load_bindings()
+        except Exception as e:
+            logger.error(f"key bindings load failed: {e}")
+            self.bindings = {}
+        self.keyboard_enabled: bool = True
+
         root = QVBoxLayout(self)
 
         # ── Camera strip ─────────────────────────────────────────────
@@ -188,6 +250,19 @@ class ControllerTab(QWidget):
             col = self._build_arm_column(arm)
             cols_row.addWidget(col)
         root.addLayout(cols_row, stretch=1)
+
+        # ── Keyboard control toggle ─────────────────────────────────
+        kb_row = QHBoxLayout()
+        self.kb_enable = QCheckBox("Keyboard control enabled (app-wide)")
+        self.kb_enable.setChecked(True)
+        self.kb_enable.stateChanged.connect(self._on_kb_toggle)
+        kb_row.addWidget(self.kb_enable)
+        self.kb_status = QLabel("")
+        self.kb_status.setStyleSheet("color: #666;")
+        kb_row.addWidget(self.kb_status)
+        kb_row.addStretch(1)
+        root.addLayout(kb_row)
+        self._refresh_kb_status_label()
 
         # ── Assisted poses ──────────────────────────────────────────
         # Both rows use SLOW_SPEED_DEG_PER_SEC so motion is predictable
@@ -238,6 +313,16 @@ class ControllerTab(QWidget):
         # ── Worker signals ──────────────────────────────────────────
         self.worker.state_updated.connect(self._on_state_updated)
         self.worker.send_error.connect(self._on_send_error)
+
+        # ── Keyboard event filter ───────────────────────────────────
+        # Installed on the QApplication so key presses work from any tab
+        # (the user wanted app-level capture when the toggle is on). Kept
+        # on this tab as an instance attribute so it's GC-safe for the
+        # whole lifetime of the UI.
+        self._kb_filter = _KeyboardFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._kb_filter)
 
     # ------------------------------------------------------------------
     # Layout
@@ -352,6 +437,60 @@ class ControllerTab(QWidget):
             f"unfold arm: {arm}, {changed} slider(s) targeting pose {pose} "
             f"at {config.SLOW_SPEED_DEG_PER_SEC} °/s"
         )
+
+    # ------------------------------------------------------------------
+    # Keyboard
+    # ------------------------------------------------------------------
+    def _on_kb_toggle(self, state: int) -> None:
+        self.keyboard_enabled = bool(state == Qt.Checked)
+        self._refresh_kb_status_label()
+        logger.info(f"keyboard control: {'on' if self.keyboard_enabled else 'off'}")
+
+    def _refresh_kb_status_label(self) -> None:
+        if not self.bindings:
+            self.kb_status.setText("(no bindings loaded)")
+        else:
+            self.kb_status.setText(f"({len(self.bindings)} keys bound)")
+
+    def reload_bindings(self) -> tuple[bool, str]:
+        """Reload key_bindings.json from disk. Returns (success, message).
+        Called by the System-tab "Reload key bindings" button.
+        """
+        try:
+            new_bindings = load_bindings()
+        except Exception as e:
+            logger.error(f"reload bindings failed: {e}")
+            return False, f"Reload failed: {e}"
+        self.bindings = new_bindings
+        self._refresh_kb_status_label()
+        logger.info(f"reloaded {len(new_bindings)} key binding(s)")
+        return True, f"Reloaded {len(new_bindings)} binding(s)."
+
+    def _apply_key_nudge(self, binding: Binding) -> None:
+        """Apply one per-keypress nudge from a bound key.
+
+        Every nudge is a flat config.KEY_DELTA_DEFAULT (1°). If the
+        target arm's torque is OFF, silently drop — no slider update,
+        no worker call.
+        """
+        arm = binding.arm
+        if not self._torque_on.get(arm, False):
+            return
+
+        delta = binding.direction * config.KEY_DELTA_DEFAULT
+
+        ui = self.joint_uis.get((arm, binding.joint))
+        if ui is None:
+            return
+
+        # Nudge from the slider's current visible target rather than from
+        # motor current. That way holding a key accumulates smoothly at
+        # the intended rate regardless of whether the motor is tracking.
+        current_target = ui.slider.value() / SLIDER_SCALE
+        new_target = self._clamp(current_target + delta, ui.min_deg, ui.max_deg)
+        self._set_slider_silent(ui, new_target)
+        ui.target_label.setText(f"{new_target:+6.1f} °")
+        self.worker.post_set_target(arm, binding.joint, new_target)
 
     def _on_slow_go_to_zero(self, arm: str) -> None:
         """Move the named arm to 0° at a fixed gentle speed.
