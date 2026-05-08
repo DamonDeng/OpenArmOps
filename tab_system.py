@@ -15,19 +15,27 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PyQt5.QtCore import QObject, QThread, pyqtSignal
+from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
+    QAbstractScrollArea,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from lerobot.robots.openarm_follower.config_openarm_follower import OpenArmFollowerConfigBase
+
+from . import config as uiconfig
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 
@@ -84,15 +92,6 @@ class SystemTab(QWidget):
         # ── Camera snapshots (diagnostic) ───────────────────────────
         snap_box = QGroupBox("Camera snapshots (diagnostic)")
         snap_layout = QVBoxLayout(snap_box)
-        snap_help = QLabel(
-            "Writes 6 PNG files: for each camera, one with bytes-as-received\n"
-            "(labeled 'as_received') and one with the R↔B swap applied\n"
-            "(labeled 'swapped'). Compare them to figure out which variant\n"
-            "shows true colors for each camera."
-        )
-        snap_help.setWordWrap(True)
-        snap_help.setStyleSheet("color: gray;")
-        snap_layout.addWidget(snap_help)
         self.btn_snapshot = QPushButton("Save camera snapshots")
         self.btn_snapshot.clicked.connect(self._on_snapshot)
         snap_layout.addWidget(self.btn_snapshot)
@@ -112,29 +111,24 @@ class SystemTab(QWidget):
         self.speed_spin.setValue(self.state.max_speed_deg_per_sec)
         self.speed_spin.valueChanged.connect(self._on_speed_changed)
         speed_form.addRow("Max commanded speed:", self.speed_spin)
-        speed_hint = QLabel(
-            "Per-tick step = max_speed / poll_hz. At 5 Hz, 5°/s = 1°/tick.\n"
-            "Raise as confidence grows; safe bring-up value is 5°/s."
-        )
-        speed_hint.setStyleSheet("color: gray;")
-        speed_form.addRow(speed_hint)
         root.addWidget(speed_box)
+
+        # ── Motor info ─────────────────────────────────────────────
+        motor_box = QGroupBox("Motor info (updated at 2 Hz)")
+        motor_layout = QHBoxLayout(motor_box)
+        self.motor_table_left = self._build_motor_table("left")
+        self.motor_table_right = self._build_motor_table("right")
+        motor_layout.addWidget(self.motor_table_left)
+        motor_layout.addWidget(self.motor_table_right)
+        root.addWidget(motor_box)
+
+        self._motor_timer = QTimer(self)
+        self._motor_timer.timeout.connect(self._refresh_motor_info)
+        self._motor_timer.start(500)  # 2 Hz
 
         # ── Calibration group ──────────────────────────────────────────
         cal_box = QGroupBox("Calibration")
         cal_layout = QVBoxLayout(cal_box)
-
-        cal_help = QLabel(
-            "Calibration sets the arm's current physical pose as 0° for every\n"
-            "joint, then writes a calibration file with generic (-90°, +90°)\n"
-            "motor ranges. Actual motion limits are still enforced by the\n"
-            "per-side joint limits in config.\n\n"
-            "Before calibrating: position the arm hanging straight down with\n"
-            "the gripper closed. Both arms should have torque OFF."
-        )
-        cal_help.setWordWrap(True)
-        cal_layout.addWidget(cal_help)
-
         cal_btn_row = QHBoxLayout()
         self.btn_cal_left = QPushButton("Calibrate LEFT arm")
         self.btn_cal_right = QPushButton("Calibrate RIGHT arm")
@@ -143,20 +137,11 @@ class SystemTab(QWidget):
         cal_btn_row.addWidget(self.btn_cal_left)
         cal_btn_row.addWidget(self.btn_cal_right)
         cal_layout.addLayout(cal_btn_row)
-
         root.addWidget(cal_box)
 
         # ── Re-zero group ─────────────────────────────────────────────
         zero_box = QGroupBox("Re-zero (does not write calibration file)")
         zero_layout = QVBoxLayout(zero_box)
-
-        zero_help = QLabel(
-            "Set current pose as 0° without writing a calibration file. Useful\n"
-            "if the reported state has drifted from the physical zero."
-        )
-        zero_help.setWordWrap(True)
-        zero_layout.addWidget(zero_help)
-
         zero_btn_row = QHBoxLayout()
         self.btn_zero_left = QPushButton("Re-zero LEFT arm")
         self.btn_zero_right = QPushButton("Re-zero RIGHT arm")
@@ -165,16 +150,7 @@ class SystemTab(QWidget):
         zero_btn_row.addWidget(self.btn_zero_left)
         zero_btn_row.addWidget(self.btn_zero_right)
         zero_layout.addLayout(zero_btn_row)
-
         root.addWidget(zero_box)
-
-        # ── Placeholder for M5 ────────────────────────────────────────
-        placeholder = QLabel(
-            "Motor info (IDs, types, per-motor state) and editable kp / kd\n"
-            "coming in M5 / v3."
-        )
-        placeholder.setStyleSheet("color: gray;")
-        root.addWidget(placeholder)
 
         root.addStretch(1)
 
@@ -243,6 +219,105 @@ class SystemTab(QWidget):
     def _on_speed_changed(self, value: float) -> None:
         self.state.max_speed_deg_per_sec = float(value)
         logger.info(f"max commanded speed set to {value:.1f} °/s")
+
+    # ------------------------------------------------------------------
+    # Motor info
+    # ------------------------------------------------------------------
+    _MOTOR_COLS = ("joint", "id", "recv", "type",
+                   "pos (°)", "vel (°/s)", "torque", "tMOS (°C)", "tRotor (°C)")
+
+    def _build_motor_table(self, arm: str) -> QGroupBox:
+        """Return a QGroupBox containing a 9-column × 8-row table for one arm.
+
+        Static columns (joint name, IDs, motor type) are filled once here.
+        Dynamic columns (pos/vel/torque/temps) are populated by
+        _refresh_motor_info on each tick.
+        """
+        box = QGroupBox(f"{arm.upper()} arm")
+        layout = QVBoxLayout(box)
+
+        # Use a throwaway config just to pull the motor_config defaults
+        # (send_id, recv_id, motor_type). Not connected — just reading
+        # the static metadata LeRobot compiled in.
+        motor_config = OpenArmFollowerConfigBase(port="dummy").motor_config
+
+        table = QTableWidget(len(uiconfig.JOINT_NAMES), len(self._MOTOR_COLS))
+        table.setHorizontalHeaderLabels(self._MOTOR_COLS)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.setFocusPolicy(0)  # don't steal focus from the Controller tab
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        # Rows are compact — default row height is too spacey.
+        row_height = 22
+        table.verticalHeader().setDefaultSectionSize(row_height)
+        # Let the table expand with the parent instead of stopping at its
+        # default sizeHint (which triggers the scrollbar at small heights).
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Minimum height that guarantees all 8 rows + header are visible
+        # even when the window is small: header (~26 px) + 8 × row_height
+        # + a few px for border.
+        table.setMinimumHeight(26 + len(uiconfig.JOINT_NAMES) * row_height + 6)
+        # Ask the table to honor sizeHint from contents (belt + suspenders).
+        table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
+
+        for row, joint in enumerate(uiconfig.JOINT_NAMES):
+            send_id, recv_id, motor_type = motor_config[joint]
+            static = [
+                joint,
+                f"0x{send_id:02X}",
+                f"0x{recv_id:02X}",
+                motor_type,
+            ]
+            for col, text in enumerate(static):
+                item = QTableWidgetItem(text)
+                item.setForeground(self.palette().text())
+                table.setItem(row, col, item)
+            # Pre-populate dynamic cells with placeholders so their widths
+            # don't jump when data first arrives.
+            for col in range(len(static), len(self._MOTOR_COLS)):
+                table.setItem(row, col, QTableWidgetItem(" — "))
+
+        table.setObjectName(f"motor_table_{arm}")
+        # Store the arm name on the table so we know what key prefix to
+        # use when looking up stats.
+        table.setProperty("arm", arm)
+        layout.addWidget(table)
+
+        # Make the group capture its table so later code can find it
+        # via the attribute set on the parent.
+        box._table = table  # type: ignore[attr-defined]
+        return box
+
+    def _refresh_motor_info(self) -> None:
+        stats = self.robot.get_motor_stats()
+        if stats is None:
+            return
+
+        for table_box in (self.motor_table_left, self.motor_table_right):
+            table = table_box._table  # type: ignore[attr-defined]
+            arm = table.property("arm")
+            for row, joint in enumerate(uiconfig.JOINT_NAMES):
+                key = f"{arm}_{joint}"
+                s = stats.get(key)
+                if s is None:
+                    continue
+                dynamic_values = (
+                    f"{s.get('position', 0.0):+7.2f}",
+                    f"{s.get('velocity', 0.0):+7.2f}",
+                    f"{s.get('torque', 0.0):+6.3f}",
+                    f"{s.get('temp_mos', 0.0):5.1f}",
+                    f"{s.get('temp_rotor', 0.0):5.1f}",
+                )
+                # Static cols are 0..3; dynamic cols start at 4.
+                for col_offset, text in enumerate(dynamic_values):
+                    col = 4 + col_offset
+                    item = table.item(row, col)
+                    if item is None:
+                        item = QTableWidgetItem(text)
+                        table.setItem(row, col, item)
+                    else:
+                        item.setText(text)
 
     def _on_snapshot(self) -> None:
         """Grab one frame from each camera and write two PNGs per camera:

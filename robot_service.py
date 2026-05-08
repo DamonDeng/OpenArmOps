@@ -244,6 +244,32 @@ class RobotService:
     def cameras_dead(self) -> bool:
         return self._cameras_dead
 
+    def get_motor_stats(self) -> dict | None:
+        """Return the Damiao bus's cached motor stats, keyed by '{arm}_{joint}'.
+
+        The public ``sync_read_all_states()`` only returns position/velocity/
+        torque, but the Damiao driver's internal ``_last_known_states`` cache
+        also holds ``temp_mos`` and ``temp_rotor`` after any recent read.
+        The motion worker polls state at 30 Hz, so this cache is always
+        fresh when the System tab reads it at 2 Hz.
+
+        Reads the cache directly rather than triggering new CAN traffic.
+        That keeps this cheap (no extra bus load) and avoids stepping on
+        the motion worker's reads.
+        """
+        with self._lock:
+            if not self._connected or self._robot is None:
+                return None
+            result: dict[str, dict[str, float]] = {}
+            for arm_name, arm in (("left", self._robot.left_arm),
+                                  ("right", self._robot.right_arm)):
+                cache = getattr(arm.bus, "_last_known_states", {}) or {}
+                for motor, stats in cache.items():
+                    # Defensive copy — the worker thread may overwrite
+                    # stats[...] any moment.
+                    result[f"{arm_name}_{motor}"] = dict(stats)
+            return result
+
     def send_action(self, action: dict) -> None:
         with self._lock:
             if not self._connected or self._robot is None:
