@@ -89,6 +89,11 @@ class _Command:
     joint: Optional[str] = None
     target_deg: Optional[float] = None
     torque_enabled: Optional[bool] = None
+    # Per-call speed override for set_target. When None, the worker uses
+    # runtime.max_speed_deg_per_sec (the System-tab setting). The override
+    # only affects the trajectory built for this one command — later
+    # commands fall back to the runtime setting unless they override too.
+    deg_per_sec: Optional[float] = None
 
 
 class MotionWorker(QThread):
@@ -120,9 +125,23 @@ class MotionWorker(QThread):
     # ------------------------------------------------------------------
     # UI-facing API — these only post to the queue, they don't touch state.
     # ------------------------------------------------------------------
-    def post_set_target(self, arm: str, joint: str, target_deg: float) -> None:
+    def post_set_target(
+        self,
+        arm: str,
+        joint: str,
+        target_deg: float,
+        deg_per_sec: Optional[float] = None,
+    ) -> None:
+        """Post a target-change command to the worker.
+
+        If ``deg_per_sec`` is provided it overrides the runtime max speed
+        for this single trajectory only (see _Command.deg_per_sec). Useful
+        for buttons like "Slow go to zero" that should move at a fixed
+        gentle speed regardless of the current System-tab setting.
+        """
         self.command_queue.put(_Command(
             kind="set_target", arm=arm, joint=joint, target_deg=target_deg,
+            deg_per_sec=deg_per_sec,
         ))
 
     def post_torque(self, arm: str, enabled: bool) -> None:
@@ -248,10 +267,16 @@ class MotionWorker(QThread):
                     # storing the target and letting the next tick rebuild.
                     # Rare: only hits if user drags before init.
                     cur = float(cmd.target_deg)  # best we can do
+                # Per-call override wins; otherwise use the System-tab setting.
+                speed = (
+                    float(cmd.deg_per_sec)
+                    if cmd.deg_per_sec is not None
+                    else self.runtime.max_speed_deg_per_sec
+                )
                 self._trajectories[key] = JointTrajectory.new(
                     start=cur,
                     target=float(cmd.target_deg),
-                    deg_per_sec=self.runtime.max_speed_deg_per_sec,
+                    deg_per_sec=speed,
                     hz=config.MOTION_HZ,
                 )
             elif cmd.kind == "torque":

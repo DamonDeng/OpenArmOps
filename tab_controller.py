@@ -189,14 +189,29 @@ class ControllerTab(QWidget):
             cols_row.addWidget(col)
         root.addLayout(cols_row, stretch=1)
 
-        # ── Go-to-zero ──────────────────────────────────────────────
+        # ── Assisted poses ──────────────────────────────────────────
+        # Both rows use SLOW_SPEED_DEG_PER_SEC so motion is predictable
+        # regardless of the System-tab max-speed setting. Unfold is the
+        # safer first step when the arm is deep in the workspace — reaching
+        # out to the side clears the table before going to zero.
+        unfold_row = QHBoxLayout()
+        self.btn_unfold_left = QPushButton("Unfold arm — LEFT")
+        self.btn_unfold_right = QPushButton("Unfold arm — RIGHT")
+        for btn in (self.btn_unfold_left, self.btn_unfold_right):
+            btn.setStyleSheet("QPushButton { padding: 8px; }")
+        self.btn_unfold_left.clicked.connect(lambda: self._on_unfold_arm("left"))
+        self.btn_unfold_right.clicked.connect(lambda: self._on_unfold_arm("right"))
+        unfold_row.addWidget(self.btn_unfold_left)
+        unfold_row.addWidget(self.btn_unfold_right)
+        root.addLayout(unfold_row)
+
         zero_row = QHBoxLayout()
-        self.btn_zero_left = QPushButton("Go to zero — LEFT arm")
-        self.btn_zero_right = QPushButton("Go to zero — RIGHT arm")
+        self.btn_zero_left = QPushButton("Slow go to zero — LEFT arm")
+        self.btn_zero_right = QPushButton("Slow go to zero — RIGHT arm")
         for btn in (self.btn_zero_left, self.btn_zero_right):
             btn.setStyleSheet("QPushButton { padding: 8px; }")
-        self.btn_zero_left.clicked.connect(lambda: self._on_go_to_zero("left"))
-        self.btn_zero_right.clicked.connect(lambda: self._on_go_to_zero("right"))
+        self.btn_zero_left.clicked.connect(lambda: self._on_slow_go_to_zero("left"))
+        self.btn_zero_right.clicked.connect(lambda: self._on_slow_go_to_zero("right"))
         zero_row.addWidget(self.btn_zero_left)
         zero_row.addWidget(self.btn_zero_right)
         root.addLayout(zero_row)
@@ -311,7 +326,41 @@ class ControllerTab(QWidget):
             pass  # the state_updated callback will sync within 33 ms
         logger.warning("UI: emergency stop posted to worker")
 
-    def _on_go_to_zero(self, arm: str) -> None:
+    def _on_unfold_arm(self, arm: str) -> None:
+        """Move the named arm to the configured "unfold" pose at the slow speed.
+
+        The target pose (``config.UNFOLD_ARM_POSE[arm]``) is shoulder fully
+        outward, everything else at 0° — a safe intermediate when the arm
+        is deep in the workspace and a direct move to zero would collide.
+        Speed is fixed at ``SLOW_SPEED_DEG_PER_SEC``.
+        """
+        pose = config.UNFOLD_ARM_POSE[arm]
+        changed = 0
+        for (a, joint), ui in self.joint_uis.items():
+            if a != arm:
+                continue
+            raw_target = float(pose.get(joint, 0.0))
+            target = self._clamp(raw_target, ui.min_deg, ui.max_deg)
+            self._set_slider_silent(ui, target)
+            ui.target_label.setText(f"{target:+6.1f} °")
+            self.worker.post_set_target(
+                arm, joint, target,
+                deg_per_sec=config.SLOW_SPEED_DEG_PER_SEC,
+            )
+            changed += 1
+        logger.info(
+            f"unfold arm: {arm}, {changed} slider(s) targeting pose {pose} "
+            f"at {config.SLOW_SPEED_DEG_PER_SEC} °/s"
+        )
+
+    def _on_slow_go_to_zero(self, arm: str) -> None:
+        """Move the named arm to 0° at a fixed gentle speed.
+
+        Posts a set_target to the worker for each of the arm's joints with
+        ``deg_per_sec=SLOW_SPEED_DEG_PER_SEC``. This overrides the current
+        System-tab max-speed setting only for these 8 trajectories; later
+        user actions still use the runtime setting.
+        """
         changed = 0
         for (a, joint), ui in self.joint_uis.items():
             if a != arm:
@@ -319,9 +368,15 @@ class ControllerTab(QWidget):
             target = self._clamp(0.0, ui.min_deg, ui.max_deg)
             self._set_slider_silent(ui, target)
             ui.target_label.setText(f"{target:+6.1f} °")
-            self.worker.post_set_target(arm, joint, target)
+            self.worker.post_set_target(
+                arm, joint, target,
+                deg_per_sec=config.SLOW_SPEED_DEG_PER_SEC,
+            )
             changed += 1
-        logger.info(f"go-to-zero: {arm} arm, {changed} slider(s) set to 0°")
+        logger.info(
+            f"slow go-to-zero: {arm} arm, {changed} slider(s) targeting 0° "
+            f"at {config.SLOW_SPEED_DEG_PER_SEC} °/s"
+        )
 
     # ------------------------------------------------------------------
     # Worker signals

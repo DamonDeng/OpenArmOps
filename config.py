@@ -49,7 +49,25 @@ MOTION_HZ = 30
 # Initial cap on commanded joint velocity. The motion worker advances each
 # joint's setpoint at this rate, regardless of whether the motor is keeping
 # up (the lead cap below handles lag). Runtime-editable from System tab.
-INITIAL_MAX_SPEED_DEG_PER_SEC = 5.0
+INITIAL_MAX_SPEED_DEG_PER_SEC = 20.0
+
+# Fixed slow speed used by the "Slow go to zero" buttons. Intentionally
+# independent of the System-tab setting — the whole point of those buttons
+# is to get a predictable, gentle motion regardless of current config.
+SLOW_SPEED_DEG_PER_SEC = 5.0
+
+# Per-arm "unfold" target pose: shoulder (joint_2) fully outward, every other
+# joint at 0°. Used by the "Unfold arm" buttons as a safe intermediate pose
+# when going directly to zero could collide with the workspace surface.
+# Sign of joint_2 is arm-specific because left and right arms' outward
+# directions are mirror images of each other (per each arm's joint_limits:
+# left joint_2 range = [-90, 9], right = [-9, 90]).
+UNFOLD_ARM_POSE = {
+    "left":  {"joint_1": 0.0, "joint_2": -90.0, "joint_3": 0.0, "joint_4": 0.0,
+              "joint_5": 0.0, "joint_6":   0.0, "joint_7": 0.0, "gripper": 0.0},
+    "right": {"joint_1": 0.0, "joint_2":  90.0, "joint_3": 0.0, "joint_4": 0.0,
+              "joint_5": 0.0, "joint_6":   0.0, "joint_7": 0.0, "gripper": 0.0},
+}
 
 # Lead cap (degrees). If setpoint would be more than LEAD_CAP degrees ahead
 # of the motor's observed current, we pause the trajectory until the motor
