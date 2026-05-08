@@ -10,7 +10,11 @@ Calibration runs on a QThread so the CAN writes don't freeze the UI.
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 
+import numpy as np
+from PIL import Image
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QDoubleSpinBox,
@@ -76,6 +80,26 @@ class SystemTab(QWidget):
         self._worker: _CalibWorker | None = None
 
         root = QVBoxLayout(self)
+
+        # ── Camera snapshots (diagnostic) ───────────────────────────
+        snap_box = QGroupBox("Camera snapshots (diagnostic)")
+        snap_layout = QVBoxLayout(snap_box)
+        snap_help = QLabel(
+            "Writes 6 PNG files: for each camera, one with bytes-as-received\n"
+            "(labeled 'as_received') and one with the R↔B swap applied\n"
+            "(labeled 'swapped'). Compare them to figure out which variant\n"
+            "shows true colors for each camera."
+        )
+        snap_help.setWordWrap(True)
+        snap_help.setStyleSheet("color: gray;")
+        snap_layout.addWidget(snap_help)
+        self.btn_snapshot = QPushButton("Save camera snapshots")
+        self.btn_snapshot.clicked.connect(self._on_snapshot)
+        snap_layout.addWidget(self.btn_snapshot)
+        self.snap_status = QLabel("")
+        self.snap_status.setStyleSheet("color: #484;")
+        snap_layout.addWidget(self.snap_status)
+        root.addWidget(snap_box)
 
         # ── Motion settings ────────────────────────────────────────────
         speed_box = QGroupBox("Motion settings (apply to both arms)")
@@ -219,3 +243,45 @@ class SystemTab(QWidget):
     def _on_speed_changed(self, value: float) -> None:
         self.state.max_speed_deg_per_sec = float(value)
         logger.info(f"max commanded speed set to {value:.1f} °/s")
+
+    def _on_snapshot(self) -> None:
+        """Grab one frame from each camera and write two PNGs per camera:
+        one with the bytes as we received them from OpenCV, and one with
+        the R↔B channel swap we currently apply in the UI. Pillow always
+        interprets arrays as RGB on save, so the "as_received" file will
+        look correct iff the camera was actually giving us RGB; the
+        "swapped" file will look correct iff the camera was giving us BGR.
+        """
+        obs = self.robot.get_observation()
+        if obs is None:
+            self.snap_status.setText("No observation available — is the robot connected?")
+            return
+
+        out_dir = Path("/home/damon/workspace/openarm_space/openarm_controller_ui_lerobot/snapshots")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+
+        written: list[str] = []
+        for cam_name in ("base", "left_wrist", "right_wrist"):
+            frame = obs.get(cam_name)
+            if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.dtype != np.uint8:
+                logger.warning(f"snapshot: skipping {cam_name} (missing or unexpected type)")
+                continue
+            # Variant 1: write bytes verbatim. Pillow interprets as RGB.
+            p1 = out_dir / f"{ts}_{cam_name}_as_received.png"
+            Image.fromarray(np.ascontiguousarray(frame)).save(p1)
+            # Variant 2: apply the R↔B swap we do at display time.
+            swapped = np.ascontiguousarray(frame[..., ::-1])
+            p2 = out_dir / f"{ts}_{cam_name}_swapped.png"
+            Image.fromarray(swapped).save(p2)
+            written.append(p1.name)
+            written.append(p2.name)
+
+        if written:
+            self.snap_status.setText(
+                f"Wrote {len(written)} file(s) to {out_dir}\n"
+                f"Compare *_as_received vs *_swapped for each camera."
+            )
+            logger.info(f"snapshots written to {out_dir}: {written}")
+        else:
+            self.snap_status.setText("No frames available to save.")

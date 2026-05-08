@@ -15,3 +15,6 @@ venv/
 # Local overrides (once we add them)
 config_local.py
 key_bindings.local.json
+
+# Diagnostic snapshots from the Camera Snapshots button
+snapshots/

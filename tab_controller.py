@@ -121,9 +121,16 @@ class _CameraPanel(QWidget):
         layout.addWidget(self.image)
 
     def update_frame(self, hwc_uint8: np.ndarray) -> None:
+        # No channel swap: our OpenCV pipeline delivers RGB directly (verified
+        # via the System-tab "Camera snapshots" diagnostic — as_received
+        # versions of all three cameras showed correct colors, swapped ones
+        # were inverted). LeRobot's OpenCVCamera appears to convert to RGB
+        # before handing the frame to us, so the classic cv2-returns-BGR
+        # assumption does not apply here. Keep an eye on this: if you ever
+        # replace the camera backend, re-run the diagnostic.
         h, w = hwc_uint8.shape[:2]
-        rgb = np.ascontiguousarray(hwc_uint8[..., ::-1])
-        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        frame = np.ascontiguousarray(hwc_uint8)
+        qimg = QImage(frame.data, w, h, 3 * w, QImage.Format_RGB888)
         pix = QPixmap.fromImage(qimg).scaledToWidth(CAM_PANEL_WIDTH, Qt.SmoothTransformation)
         self.image.setPixmap(pix)
 
