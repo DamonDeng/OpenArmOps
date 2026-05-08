@@ -13,8 +13,10 @@ import threading
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.motors import MotorCalibration
-from lerobot.robots.bi_openarm_follower import BiOpenArmFollower, BiOpenArmFollowerConfig
+from lerobot.robots.bi_openarm_follower import BiOpenArmFollowerConfig
 from lerobot.robots.openarm_follower.config_openarm_follower import OpenArmFollowerConfigBase
+
+from .bi_openarm_follower_no_auto_zero import BiOpenArmFollowerNoAutoZero
 
 from . import config
 
@@ -30,7 +32,7 @@ class RobotService:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._robot: BiOpenArmFollower | None = None
+        self._robot: BiOpenArmFollowerNoAutoZero | None = None
         self._connected = False
         # Tracks whether cameras are known-dead. We log the transition ONCE
         # (not per tick) and then fall back to a state-only observation until
@@ -75,7 +77,11 @@ class RobotService:
             )
 
             logger.info("Connecting BiOpenArmFollower…")
-            self._robot = BiOpenArmFollower(cfg)
+            # Use our subclasses that skip the automatic set_zero_position
+            # call during connect — preserves the motor's factory-calibrated
+            # zero across app restarts.
+            self._robot = BiOpenArmFollowerNoAutoZero(cfg)
+
             # calibrate=False: skip the built-in `input()` prompt that blocks
             # startup asking the user to position the arms. Calibration is a
             # deliberate action from the System tab, not a startup side effect.
