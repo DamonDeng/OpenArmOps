@@ -27,6 +27,7 @@ from .key_bindings import load_bindings
 from .motion_worker import MotionWorker
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
+from .session_config import load_session
 from .tab_cartesian import CartesianTab
 from .tab_controller import ControllerTab
 from .tab_system import SystemTab
@@ -127,6 +128,14 @@ def main() -> int:
         return 2
 
     state = RuntimeState()
+    # Auto-load persisted motion settings if a config file exists. Missing
+    # file: silent pass-through (defaults apply). Malformed file: log and
+    # keep defaults so startup isn't blocked.
+    if config.SESSION_CONFIG_PATH.exists():
+        try:
+            load_session(state)
+        except Exception as e:
+            logger.error(f"Failed to load session config: {e}. Using defaults.")
     worker = MotionWorker(robot, state)
     worker.start()
     window = MainWindow(robot, state, worker)

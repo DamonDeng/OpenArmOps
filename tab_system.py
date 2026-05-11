@@ -38,6 +38,7 @@ from lerobot.robots.openarm_follower.config_openarm_follower import OpenArmFollo
 from . import config as uiconfig
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
+from .session_config import load_session, reset_to_defaults, save_session
 
 # TYPE_CHECKING-only import to break a circular-import cycle: ControllerTab
 # imports from tab_system -> tab_system would import ControllerTab back. At
@@ -111,7 +112,11 @@ class SystemTab(QWidget):
 
         # ── Motion settings ────────────────────────────────────────────
         speed_box = QGroupBox("Motion settings (apply to both arms)")
-        speed_form = QFormLayout(speed_box)
+        speed_outer = QVBoxLayout(speed_box)
+
+        speed_form_widget = QWidget()
+        speed_form = QFormLayout(speed_form_widget)
+        speed_form.setContentsMargins(0, 0, 0, 0)
         self.speed_spin = QDoubleSpinBox()
         self.speed_spin.setDecimals(1)
         self.speed_spin.setRange(0.1, 120.0)
@@ -129,6 +134,35 @@ class SystemTab(QWidget):
         self.gcomp_spin.setValue(self.state.gravity_comp_scale)
         self.gcomp_spin.valueChanged.connect(self._on_gravity_comp_changed)
         speed_form.addRow("Gravity comp scale:", self.gcomp_spin)
+        speed_outer.addWidget(speed_form_widget)
+
+        # Save / Load / Reset persistence row.
+        persist_row = QHBoxLayout()
+        self.btn_save_motion = QPushButton("Save config")
+        self.btn_load_motion = QPushButton("Load config")
+        self.btn_reset_motion = QPushButton("Reset to default")
+        self.btn_save_motion.setToolTip(
+            f"Write current values to {uiconfig.SESSION_CONFIG_PATH}"
+        )
+        self.btn_load_motion.setToolTip(
+            f"Read values from {uiconfig.SESSION_CONFIG_PATH} and apply them"
+        )
+        self.btn_reset_motion.setToolTip(
+            "Restore compile-time defaults. Does not write the file — "
+            "click Save after if you want the file to match."
+        )
+        self.btn_save_motion.clicked.connect(self._on_save_motion_config)
+        self.btn_load_motion.clicked.connect(self._on_load_motion_config)
+        self.btn_reset_motion.clicked.connect(self._on_reset_motion_config)
+        persist_row.addWidget(self.btn_save_motion)
+        persist_row.addWidget(self.btn_load_motion)
+        persist_row.addWidget(self.btn_reset_motion)
+        persist_row.addStretch(1)
+        speed_outer.addLayout(persist_row)
+
+        self.motion_config_status = QLabel("")
+        self.motion_config_status.setStyleSheet("color: #484;")
+        speed_outer.addWidget(self.motion_config_status)
 
         root.addWidget(speed_box)
 
@@ -256,6 +290,64 @@ class SystemTab(QWidget):
     def _on_gravity_comp_changed(self, value: float) -> None:
         self.state.gravity_comp_scale = float(value)
         logger.info(f"gravity comp scale set to {value:.2f}")
+
+    def _sync_motion_spinboxes_from_state(self) -> None:
+        """After load/reset, push state values back into the spinboxes
+        without triggering their valueChanged slots (which would just
+        echo the same values back into state).
+        """
+        for spin, value in (
+            (self.speed_spin, self.state.max_speed_deg_per_sec),
+            (self.gcomp_spin, self.state.gravity_comp_scale),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+
+    def _set_motion_status(self, msg: str, ok: bool = True) -> None:
+        self.motion_config_status.setText(msg)
+        self.motion_config_status.setStyleSheet(
+            "color: #484;" if ok else "color: #c44;"
+        )
+
+    def _on_save_motion_config(self) -> None:
+        try:
+            path = save_session(self.state)
+        except Exception as e:
+            logger.exception("save motion config failed")
+            self._set_motion_status(f"Save failed: {e}", ok=False)
+            return
+        self._set_motion_status(
+            f"Saved to {path} (speed={self.state.max_speed_deg_per_sec:.1f}, "
+            f"gravity={self.state.gravity_comp_scale:.2f})"
+        )
+
+    def _on_load_motion_config(self) -> None:
+        try:
+            applied = load_session(self.state)
+        except FileNotFoundError:
+            self._set_motion_status(
+                f"No saved config at {uiconfig.SESSION_CONFIG_PATH}", ok=False
+            )
+            return
+        except Exception as e:
+            logger.exception("load motion config failed")
+            self._set_motion_status(f"Load failed: {e}", ok=False)
+            return
+        self._sync_motion_spinboxes_from_state()
+        if applied:
+            fields = ", ".join(f"{k}={v:.2f}" for k, v in applied.items())
+            self._set_motion_status(f"Loaded: {fields}")
+        else:
+            self._set_motion_status(
+                "Loaded file had no recognized fields (state unchanged)"
+            )
+
+    def _on_reset_motion_config(self) -> None:
+        applied = reset_to_defaults(self.state)
+        self._sync_motion_spinboxes_from_state()
+        fields = ", ".join(f"{k}={v:.2f}" for k, v in applied.items())
+        self._set_motion_status(f"Reset to defaults: {fields}")
 
     def _on_reload_bindings(self) -> None:
         ok, msg = self.controller_tab.reload_bindings()

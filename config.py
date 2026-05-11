@@ -100,6 +100,13 @@ LEAD_CAP_DEG = 10.0
 # from resuming when the user picks the arm back up after a pause.
 TRAJECTORY_STALENESS_SEC = 0.5
 
+# ── User-writable session config ──────────────────────────────────────
+# Persisted runtime-tunable settings (max speed, gravity comp scale, …).
+# Lives outside the package so rebuilds don't clobber it and so we don't
+# pollute the repo with per-user values.
+SESSION_CONFIG_DIR = Path.home() / ".openarm_ui_config"
+SESSION_CONFIG_PATH = SESSION_CONFIG_DIR / "motion_settings.json"
+
 # Per-keypress target nudge in degrees. Shift is used as a layer selector
 # (shoulder vs elbow/rotation), not as a coarse-speed modifier; every
 # nudge is the same size. Hold a key → OS key-repeat advances the target
