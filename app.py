@@ -27,6 +27,7 @@ from .key_bindings import load_bindings
 from .motion_worker import MotionWorker
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
+from .tab_cartesian import CartesianTab
 from .tab_controller import ControllerTab
 from .tab_system import SystemTab
 
@@ -49,13 +50,23 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         self.controller_tab = ControllerTab(robot, state, worker)
+        self.cartesian_tab = CartesianTab(robot, worker)
         # System tab gets a reference to the controller tab so its
         # "Reload key bindings" button can reach into ControllerTab's
-        # bindings dict. Small coupling; acceptable for a two-tab app.
+        # bindings dict.
         self.system_tab = SystemTab(robot, state, self.controller_tab)
-        tabs.addTab(self.controller_tab, "Controller")
+        tabs.addTab(self.controller_tab, "Controller (movej)")
+        tabs.addTab(self.cartesian_tab, "Cartesian (movel)")
         tabs.addTab(self.system_tab, "System")
         self.setCentralWidget(tabs)
+
+        # Wire the cross-tab callbacks. The Controller tab's keyboard
+        # filter hands cartesian bindings to the Cartesian tab; the
+        # Cartesian tab hands gripper nudges (which are 1-DOF and not
+        # part of the pose target) back to the Controller tab's
+        # existing gripper-slider path.
+        self.controller_tab.cartesian_nudge_callback = self.cartesian_tab.handle_cartesian_nudge
+        self.cartesian_tab.set_gripper_nudge_callback(self.controller_tab.nudge_gripper_target)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)

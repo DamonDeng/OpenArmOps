@@ -42,7 +42,7 @@ from lerobot.robots.openarm_follower.config_openarm_follower import (
 )
 
 from . import config
-from .key_bindings import Binding, load_bindings
+from .key_bindings import Binding, BindingTable, load_bindings
 from .motion_worker import MotionWorker
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
@@ -220,12 +220,23 @@ class _KeyboardFilter(QObject):
         else:
             modifier = "none"
 
-        binding = self.tab.bindings.get((ch, modifier))
-        if binding is None:
-            return False
+        # Look up in both mode tables; the one whose arm is actually in
+        # that mode wins. If neither matches the current mode of its arm,
+        # no binding fires.
+        lookup_key = (ch, modifier)
+        tables = self.tab.bindings
+        joint_hit = tables.joint.get(lookup_key)
+        cart_hit = tables.cartesian.get(lookup_key)
 
-        self.tab._apply_key_nudge(binding)
-        return True  # consume
+        for hit in (joint_hit, cart_hit):
+            if hit is None:
+                continue
+            if self.tab.worker.current_mode(hit.arm) != hit.mode:
+                continue
+            self.tab._apply_key_nudge(hit)
+            return True  # consume
+
+        return False
 
 
 class ControllerTab(QWidget):
@@ -496,15 +507,45 @@ class ControllerTab(QWidget):
         logger.info(f"reloaded {len(new_bindings)} key binding(s)")
         return True, f"Reloaded {len(new_bindings)} binding(s)."
 
+    def nudge_gripper_target(self, arm: str, sign: int) -> None:
+        """Nudge the named arm's gripper slider by ``sign * KEY_DELTA_DEFAULT``.
+
+        Entry point for CartesianTab: when a user presses Alt+e/d while an
+        arm is in Cartesian mode, the gripper binding routes here because
+        gripper is 1-DOF and has no cartesian analog.
+        """
+        ui = self.joint_uis.get((arm, "gripper"))
+        if ui is None:
+            return
+        if not self._torque_on.get(arm, False):
+            return
+        delta = sign * config.KEY_DELTA_DEFAULT
+        new_target = self._clamp(ui.slider.value() / SLIDER_SCALE + delta,
+                                 ui.min_deg, ui.max_deg)
+        self._set_slider_silent(ui, new_target)
+        ui.target_label.setText(f"{new_target:+6.1f} °")
+        self.worker.post_set_target(arm, "gripper", new_target)
+
     def _apply_key_nudge(self, binding: Binding) -> None:
         """Apply one per-keypress nudge from a bound key.
 
-        Every nudge is a flat config.KEY_DELTA_DEFAULT (1°). If the
-        target arm's torque is OFF, silently drop — no slider update,
-        no worker call.
+        For joint-mode bindings: nudge the slider's target by 1°.
+        For cartesian-mode bindings: delegate to the Cartesian tab so it
+        can update its spinboxes and post a new cart target to the worker.
+
+        Common preconditions:
+        - Target arm's torque must be ON; otherwise silently drop.
         """
         arm = binding.arm
         if not self._torque_on.get(arm, False):
+            return
+
+        if binding.mode == "cartesian":
+            # The Cartesian tab owns the cart-target state and UI. Route
+            # this nudge there and let it handle spinbox + worker post.
+            cb = getattr(self, "cartesian_nudge_callback", None)
+            if cb is not None:
+                cb(binding)
             return
 
         delta = binding.direction * config.KEY_DELTA_DEFAULT
