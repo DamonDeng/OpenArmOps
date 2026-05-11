@@ -32,6 +32,7 @@ from .tab_cartesian import CartesianTab
 from .tab_controller import ControllerTab
 from .tab_system import SystemTab
 from .tab_vr import VRTab
+from .tab_vr_control import VRControlTab
 from .vr_input import VRInputReceiver
 
 logger = logging.getLogger(__name__)
@@ -56,14 +57,16 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self.controller_tab = ControllerTab(robot, state, worker)
         self.cartesian_tab = CartesianTab(robot, worker)
-        self.vr_tab = VRTab(vr_receiver)
+        self.vr_info_tab = VRTab(vr_receiver)
+        self.vr_control_tab = VRControlTab(worker, vr_receiver)
         # System tab gets a reference to the controller tab so its
         # "Reload key bindings" button can reach into ControllerTab's
         # bindings dict.
         self.system_tab = SystemTab(robot, state, self.controller_tab)
         tabs.addTab(self.controller_tab, "Controller (movej)")
         tabs.addTab(self.cartesian_tab, "Cartesian (movel)")
-        tabs.addTab(self.vr_tab, "VR")
+        tabs.addTab(self.vr_info_tab, "VR Info")
+        tabs.addTab(self.vr_control_tab, "VR Control")
         tabs.addTab(self.system_tab, "System")
         self.setCentralWidget(tabs)
 
@@ -145,10 +148,14 @@ def main() -> int:
             load_session(state)
         except Exception as e:
             logger.error(f"Failed to load session config: {e}. Using defaults.")
-    worker = MotionWorker(robot, state)
-    worker.start()
-
+    # VR receiver is constructed before the motion worker so the worker
+    # can hold a reference to it (Phase 2b-β reads controller state from
+    # it each tick). We start() it after the worker starts so its logs
+    # appear after the "MotionWorker started" banner.
     vr_receiver = VRInputReceiver()
+
+    worker = MotionWorker(robot, state, vr_receiver=vr_receiver)
+    worker.start()
     vr_receiver.start()
 
     window = MainWindow(robot, state, worker, vr_receiver)

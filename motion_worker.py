@@ -43,6 +43,7 @@ from .ik_solver import (
 )
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
+from .vr_input import VRInputReceiver
 
 try:
     import numpy as np
@@ -213,10 +214,19 @@ class MotionWorker(QThread):
     state_updated = pyqtSignal(dict)      # {"right_joint_1.pos": 12.3, ...}
     send_error = pyqtSignal(str)
 
-    def __init__(self, robot: RobotService, runtime: RuntimeState) -> None:
+    def __init__(
+        self,
+        robot: RobotService,
+        runtime: RuntimeState,
+        vr_receiver: VRInputReceiver | None = None,
+    ) -> None:
         super().__init__()
         self.robot = robot
         self.runtime = runtime
+        # Optional: set in Phase 2b-α so the worker can read controller
+        # state directly when VR control is enabled for an arm. Phase 2b-α
+        # only stores the reference — no per-tick reads yet.
+        self.vr_receiver = vr_receiver
         self.command_queue: queue.Queue[_Command] = queue.Queue()
         self._stop_flag = False
 
@@ -254,6 +264,13 @@ class MotionWorker(QThread):
         # keep the arm pinned to its last good joint target until either
         # the target changes or the user fixes the pose.
         self._ik_failed: dict[str, bool] = {"left": False, "right": False}
+
+        # Per-arm VR-control hard enable. Phase 2b-α just tracks the flag
+        # (so the UI can toggle and we can see the state round-trip); no
+        # motor behavior change yet. Phase 2b-β will, when True, poll
+        # self.vr_receiver each tick and update self._cart_target from
+        # controller deltas when grip is above threshold.
+        self._vr_enabled: dict[str, bool] = {"left": False, "right": False}
 
     # ------------------------------------------------------------------
     # UI-facing API — these only post to the queue, they don't touch state.
@@ -297,6 +314,18 @@ class MotionWorker(QThread):
         dict read is atomic for a single key, and this is only read by
         the UI thread to decide slider enable/disable."""
         return self._mode.get(arm, "joint")
+
+    def post_vr_enable(self, arm: str, enabled: bool) -> None:
+        """Toggle VR hard-enable for one arm. Phase 2b-α: flips the flag
+        and switches the arm to cartesian mode when enabled. The motor-
+        side behavior (grip-gated pose tracking, trigger→gripper, etc.)
+        lands in Phase 2b-β.
+        """
+        self.command_queue.put(_Command(kind="vr_enable", arm=arm, torque_enabled=enabled))
+
+    def vr_enabled(self, arm: str) -> bool:
+        """Read-only VR-enable state for the UI."""
+        return self._vr_enabled.get(arm, False)
 
     def compute_fk(self, arm: str) -> Optional[pin.SE3]:
         """Return the arm's current TCP pose (from the last observed joint
@@ -681,6 +710,38 @@ class MotionWorker(QThread):
             elif cmd.kind == "set_cart_target":
                 if cmd.arm in self._cart_target:
                     self._cart_target[cmd.arm] = cmd.cart_target
+            elif cmd.kind == "vr_enable":
+                arm = cmd.arm or ""
+                enabled = bool(cmd.torque_enabled)
+                if arm not in self._vr_enabled:
+                    continue
+                self._vr_enabled[arm] = enabled
+                if enabled:
+                    # Switch to cartesian mode so the (future) per-tick
+                    # VR pose updates have somewhere to land. Seed the
+                    # cart_target from current TCP pose so the arm
+                    # doesn't jump on mode switch.
+                    self._mode[arm] = "cartesian"
+                    self._last_ik_q_deg[arm] = None
+                    self._ik_failed[arm] = False
+                    fk = self.compute_fk(arm)
+                    if fk is not None:
+                        x, y, z, roll, pitch, yaw = pose_to_xyzrpy(fk)
+                        self._cart_target[arm] = CartesianTarget(
+                            x=x, y=y, z=z,
+                            roll=roll, pitch=pitch, yaw=yaw,
+                        )
+                    logger.info(
+                        f"{arm}: VR control ENABLED; arm switched to cartesian "
+                        f"mode (Phase 2b-α — not yet tracking controller pose)"
+                    )
+                else:
+                    # Drop back to joint mode so the arm stops consuming
+                    # cartesian targets. Trajectories pin to current in
+                    # the joint-mode per-tick path on the next tick.
+                    self._mode[arm] = "joint"
+                    self._cart_target[arm] = None
+                    logger.info(f"{arm}: VR control DISABLED; arm back to joint mode")
             elif cmd.kind == "estop":
                 for arm in ("left", "right"):
                     self.robot.set_torque(arm, False)
@@ -698,15 +759,19 @@ class MotionWorker(QThread):
                 # dials it back up from the System tab.
                 self.runtime.gravity_comp_scale = 0.0
                 # Drop cartesian mode — operator has to deliberately
-                # re-enter it. Cleared targets too.
+                # re-enter it. Cleared targets too. Also drop VR hard-
+                # enable so controller motion doesn't silently resume
+                # the moment torque comes back.
                 for arm in ("left", "right"):
                     self._mode[arm] = "joint"
                     self._cart_target[arm] = None
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
+                    self._vr_enabled[arm] = False
                 logger.warning(
                     "motion worker: e-stop consumed; torque off; trajectories pinned; "
-                    "gravity_comp_scale reset to 0; arms returned to joint mode"
+                    "gravity_comp_scale reset to 0; arms returned to joint mode; "
+                    "VR control disabled"
                 )
 
     def _read_state(self) -> Optional[dict[str, float]]:
