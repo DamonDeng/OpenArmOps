@@ -181,6 +181,27 @@ class CartesianTarget:
 
 
 @dataclass
+class _VRSnapshot:
+    """Frozen pose pair taken on grip rising-edge. Used to compute
+    arm-target = arm_snapshot * controller_delta each subsequent tick.
+
+    Stored as Pinocchio SE3 objects for easy composition.
+    """
+    controller: "pin.SE3"
+    arm: "pin.SE3"
+
+# Safety: if the Pico pose jumps by more than this in a single tick,
+# clamp the delta before applying. Guards against tracking glitches.
+_VR_MAX_TICK_TRANS_M = 0.10    # 10 cm
+_VR_MAX_TICK_ROT_RAD = math.radians(30.0)
+
+# Gripper physical range in degrees. From joint_limits: -65 = fully open,
+# 0 = fully closed. Trigger 0 → gripper -65; trigger 1 → gripper 0.
+_GRIPPER_DEG_OPEN = -65.0
+_GRIPPER_DEG_CLOSED = 0.0
+
+
+@dataclass
 class _Command:
     """Message posted from UI thread to the worker. Minimal; keep serializable."""
     # "set_target"         — joint target change
@@ -265,12 +286,15 @@ class MotionWorker(QThread):
         # the target changes or the user fixes the pose.
         self._ik_failed: dict[str, bool] = {"left": False, "right": False}
 
-        # Per-arm VR-control hard enable. Phase 2b-α just tracks the flag
-        # (so the UI can toggle and we can see the state round-trip); no
-        # motor behavior change yet. Phase 2b-β will, when True, poll
-        # self.vr_receiver each tick and update self._cart_target from
-        # controller deltas when grip is above threshold.
+        # Per-arm VR-control hard enable.
         self._vr_enabled: dict[str, bool] = {"left": False, "right": False}
+        # Clutch snapshot per arm: set on grip rising edge, cleared on
+        # falling edge. While held, each tick computes
+        #   cart_target = arm_snapshot ⊕ (controller_now ⊖ controller_snapshot)
+        # using Pinocchio SE3 composition.
+        self._vr_snapshot: dict[str, Optional[_VRSnapshot]] = {
+            "left": None, "right": None,
+        }
 
     # ------------------------------------------------------------------
     # UI-facing API — these only post to the queue, they don't touch state.
@@ -430,7 +454,16 @@ class MotionWorker(QThread):
                 )
             self._initialized = True
 
-        # 3a. For arms in cartesian mode, solve IK once and write the
+        # 3a. For VR-enabled arms, read the latest controller state and
+        # update _cart_target based on grip-gated relative tracking.
+        # Runs before _cartesian_tick so the IK step picks up the new
+        # target this same tick.
+        for arm in ("left", "right"):
+            if not self._vr_enabled[arm]:
+                continue
+            self._vr_tick(arm)
+
+        # 3b. For arms in cartesian mode, solve IK once and write the
         # resulting joint angles as new targets. The rest of the tick
         # (ramp + lead cap + send) runs exactly as in joint mode.
         for arm in ("left", "right"):
@@ -582,6 +615,182 @@ class MotionWorker(QThread):
     # ------------------------------------------------------------------
     # Cartesian mode
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # VR tick (mouse-clutch model)
+    # ------------------------------------------------------------------
+    def _vr_tick(self, arm: str) -> None:
+        """Per-tick update of _cart_target for a VR-enabled arm.
+
+        Clutch model (mouse-ball analogy):
+          - grip ≥ threshold, no snapshot → take snapshot (both controller
+            pose and arm TCP pose), and hold arm at current pose (no
+            motion yet — we need at least one more tick to have a delta).
+          - grip ≥ threshold, snapshot held → cart_target =
+            arm_snapshot ⊕ (controller_now ⊖ controller_snapshot), with
+            dead-band and single-tick safety clamp applied.
+          - grip < threshold → clear snapshot (clutch disengaged).
+            _cart_target stays at its last value → arm freezes in place.
+
+        Trigger drives the gripper independently: trigger released =
+        gripper open (-65°), trigger pulled = gripper closed (0°). Maps
+        linearly with no dead-man gating — the gripper can open/close
+        even when the clutch is released (consistent with "invisible
+        spring" behavior — you always have gripper control).
+        """
+        if self.vr_receiver is None:
+            return
+        state = self.vr_receiver.left() if arm == "left" else self.vr_receiver.right()
+        if not state.has_ever_been_seen:
+            return
+
+        # Trigger → gripper (no clutch gate).
+        trig = max(0.0, min(1.0, state.trigger))
+        gripper_target = (
+            _GRIPPER_DEG_OPEN + (_GRIPPER_DEG_CLOSED - _GRIPPER_DEG_OPEN) * trig
+        )
+
+        grip_engaged = state.grip >= config.VR_GRIP_ENABLE_THRESHOLD
+
+        # Build current controller SE3 from the raw datagram fields.
+        # APK sends quaternion in xyzw order; Pinocchio Quaternion takes
+        # (w, x, y, z). We construct from a rotation matrix via numpy
+        # to avoid any binding surprises.
+        ctrl_pose = self._controller_pose(state)
+
+        if not grip_engaged:
+            # Clutch released. Drop the snapshot (so the next engage
+            # gets a fresh baseline). Do NOT clear _cart_target — arm
+            # holds at whatever pose we last commanded.
+            if self._vr_snapshot[arm] is not None:
+                logger.info(f"{arm}: VR clutch released")
+            self._vr_snapshot[arm] = None
+            # Still update gripper independent of clutch.
+            self._update_gripper_only(arm, gripper_target)
+            return
+
+        if self._vr_snapshot[arm] is None:
+            # Rising edge: take fresh snapshots. Controller pose = now.
+            # Arm pose = FK of current joints.
+            arm_pose = self.compute_fk(arm)
+            if arm_pose is None:
+                # No FK available yet (e.g. first tick before init);
+                # retry next tick.
+                return
+            self._vr_snapshot[arm] = _VRSnapshot(controller=ctrl_pose, arm=arm_pose)
+            logger.info(f"{arm}: VR clutch engaged; snapshot taken")
+            # Target = arm snapshot itself (no motion yet).
+            self._apply_vr_cart_target(arm, arm_pose, gripper_target)
+            return
+
+        # Grip held and snapshot exists → compute delta, apply to arm_snapshot.
+        snap = self._vr_snapshot[arm]
+        # SE3 delta: delta = ctrl_snapshot^-1 * ctrl_now (in snapshot frame)
+        # Apply to arm_snapshot: target = arm_snapshot * delta
+        # (Axis remap will eventually go here; identity for now.)
+        delta = snap.controller.actInv(ctrl_pose)
+
+        # Dead-band check (applied to the delta, so noise below threshold
+        # contributes nothing). Translation from log is 6-vector; we
+        # inspect translation and rotation magnitudes separately.
+        delta_log = pin.log(delta).vector  # [vx, vy, vz, wx, wy, wz]
+        trans_norm = float(np.linalg.norm(delta_log[:3]))
+        rot_norm = float(np.linalg.norm(delta_log[3:]))
+        if (trans_norm < config.VR_DEAD_BAND_POS_M
+                and rot_norm < config.VR_DEAD_BAND_ROT_RAD):
+            # Entirely within dead-band; hold current target, update
+            # only the gripper (which has no dead-band).
+            target = snap.arm  # effectively no motion from snapshot
+            self._apply_vr_cart_target(arm, target, gripper_target)
+            return
+
+        # Safety clamp: if the delta is absurdly large in one tick
+        # (tracking glitch, Pico pose snap), clamp proportionally so we
+        # don't slam the arm. The ramp downstream also enforces speed,
+        # but it's safer to clamp at the source.
+        scale_trans = 1.0
+        if trans_norm > _VR_MAX_TICK_TRANS_M:
+            scale_trans = _VR_MAX_TICK_TRANS_M / trans_norm
+        scale_rot = 1.0
+        if rot_norm > _VR_MAX_TICK_ROT_RAD:
+            scale_rot = _VR_MAX_TICK_ROT_RAD / rot_norm
+        if scale_trans < 1.0 or scale_rot < 1.0:
+            logger.warning(
+                f"{arm}: VR delta clamped "
+                f"(trans {trans_norm*1000:.0f}mm scale {scale_trans:.2f}, "
+                f"rot {math.degrees(rot_norm):.0f}° scale {scale_rot:.2f})"
+            )
+            v = delta_log.copy()
+            v[:3] *= scale_trans
+            v[3:] *= scale_rot
+            delta = pin.exp(v)
+
+        target = snap.arm * delta
+        self._apply_vr_cart_target(arm, target, gripper_target)
+
+    def _controller_pose(self, state) -> "pin.SE3":
+        """Build an SE3 from a ControllerState's position + quaternion."""
+        # APK quaternion order is xyzw; Pinocchio wants wxyz constructor
+        # args but also accepts a rotation matrix directly. Use matrix
+        # to avoid ambiguity.
+        q_xyzw = np.array([state.qx, state.qy, state.qz, state.qw], dtype=float)
+        # Normalize defensively — the stream is close to unit but has jitter.
+        n = np.linalg.norm(q_xyzw)
+        if n < 1e-9:
+            q_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
+        else:
+            q_xyzw /= n
+        qx, qy, qz, qw = q_xyzw
+        # Standard xyzw → rotation matrix.
+        R = np.array([
+            [1 - 2*(qy*qy + qz*qz),   2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw),       1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw),       2*(qy*qz + qx*qw),     1 - 2*(qx*qx + qy*qy)],
+        ])
+        t = np.array([state.tx, state.ty, state.tz], dtype=float)
+        return pin.SE3(R, t)
+
+    def _apply_vr_cart_target(
+        self,
+        arm: str,
+        pose: "pin.SE3",
+        gripper_target_deg: float,
+    ) -> None:
+        """Write the arm's cart_target field from a Pinocchio SE3 plus
+        the current gripper command. This is what _cartesian_tick will
+        consume on the same tick.
+        """
+        x, y, z, roll, pitch, yaw = pose_to_xyzrpy(pose)
+        self._cart_target[arm] = CartesianTarget(
+            x=x, y=y, z=z,
+            roll=roll, pitch=pitch, yaw=yaw,
+            gripper=gripper_target_deg,
+        )
+
+    def _update_gripper_only(self, arm: str, gripper_target_deg: float) -> None:
+        """When clutch is released we still want the gripper to respond
+        to the trigger. Preserve whatever translation/rotation the last
+        cart_target had; just swap in the new gripper value.
+        """
+        prev = self._cart_target[arm]
+        if prev is None:
+            # No baseline pose — take one from FK so _cartesian_tick has
+            # something valid to consume. Rare: first tick after enable
+            # with clutch still off.
+            fk = self.compute_fk(arm)
+            if fk is None:
+                return
+            x, y, z, roll, pitch, yaw = pose_to_xyzrpy(fk)
+            self._cart_target[arm] = CartesianTarget(
+                x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw,
+                gripper=gripper_target_deg,
+            )
+            return
+        self._cart_target[arm] = CartesianTarget(
+            x=prev.x, y=prev.y, z=prev.z,
+            roll=prev.roll, pitch=prev.pitch, yaw=prev.yaw,
+            gripper=gripper_target_deg,
+        )
+
     def _cartesian_tick(self, arm: str, current: dict[str, float]) -> None:
         """Solve IK for this arm's cartesian target, overwrite its joint
         trajectories with the solution. Only runs when arm is in cartesian
@@ -741,6 +950,7 @@ class MotionWorker(QThread):
                     # the joint-mode per-tick path on the next tick.
                     self._mode[arm] = "joint"
                     self._cart_target[arm] = None
+                    self._vr_snapshot[arm] = None
                     logger.info(f"{arm}: VR control DISABLED; arm back to joint mode")
             elif cmd.kind == "estop":
                 for arm in ("left", "right"):
@@ -768,6 +978,7 @@ class MotionWorker(QThread):
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
                     self._vr_enabled[arm] = False
+                    self._vr_snapshot[arm] = None
                 logger.warning(
                     "motion worker: e-stop consumed; torque off; trajectories pinned; "
                     "gravity_comp_scale reset to 0; arms returned to joint mode; "

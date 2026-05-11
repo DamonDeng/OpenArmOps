@@ -61,10 +61,11 @@ class _ArmVRPanel(QGroupBox):
         v.addWidget(self.btn_enable)
 
         self.status_mode = QLabel("Mode: —")
+        self.status_clutch = QLabel("Clutch: —")
         self.status_grip = QLabel("Grip: —")
         self.status_trigger = QLabel("Trigger: —")
         self.status_pose_age = QLabel("Controller: no data")
-        for lbl in (self.status_mode, self.status_grip,
+        for lbl in (self.status_mode, self.status_clutch, self.status_grip,
                     self.status_trigger, self.status_pose_age):
             lbl.setStyleSheet("color: #666;")
             v.addWidget(lbl)
@@ -105,11 +106,25 @@ class _ArmVRPanel(QGroupBox):
 
         import time
         age_ms = (time.monotonic() - state.last_rx) * 1000.0
+        # Grip = dead-man. Above threshold → arm tracks controller;
+        # below → clutch released, arm holds.
+        from . import config as uicfg
+        engaged = state.grip >= uicfg.VR_GRIP_ENABLE_THRESHOLD
+        if enabled and engaged:
+            self.status_clutch.setText("Clutch: ENGAGED (tracking)")
+            self.status_clutch.setStyleSheet("color: #2a7; font-weight: bold;")
+        elif enabled:
+            self.status_clutch.setText("Clutch: released (arm held)")
+            self.status_clutch.setStyleSheet("color: #888;")
+        else:
+            self.status_clutch.setText("Clutch: (VR disabled)")
+            self.status_clutch.setStyleSheet("color: #666;")
+
         self.status_grip.setText(
-            f"Grip: {state.grip:.2f}  (Phase 2b-β will use this as dead-man)"
+            f"Grip: {state.grip:.2f}  (threshold {uicfg.VR_GRIP_ENABLE_THRESHOLD})"
         )
         self.status_trigger.setText(
-            f"Trigger: {state.trigger:.2f}  (→ gripper in Phase 2b-β)"
+            f"Trigger: {state.trigger:.2f}  (→ gripper, 0=open -65° / 1=closed 0°)"
         )
         self.status_pose_age.setText(
             f"Controller: last packet {age_ms:.0f} ms ago"
