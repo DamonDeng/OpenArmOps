@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 
 from lerobot.robots.bi_openarm_follower import BiOpenArmFollower, BiOpenArmFollowerConfig
+from lerobot.utils.decorators import check_if_already_connected
 
 from .openarm_follower_no_auto_zero import OpenArmFollowerNoAutoZero
 
@@ -52,3 +53,20 @@ class BiOpenArmFollowerNoAutoZero(BiOpenArmFollower):
             **self.right_arm.cameras,
         }
         logger.info("BiOpenArmFollowerNoAutoZero: sub-arms swapped, motor zero will be preserved on connect.")
+
+    @check_if_already_connected
+    def connect(self, calibrate: bool = True) -> None:
+        """Same shape as BiOpenArmFollower.connect — delegate to each arm
+        individually — but after connect finishes, rebuild our aggregate
+        ``self.cameras`` in case either arm dropped a camera (unplugged,
+        wrong device index, permissions). OpenArmFollowerNoAutoZero.connect
+        prunes dead cameras from its own .cameras dict; we mirror that
+        pruning up to the bimanual level so any downstream code that
+        iterates ``robot.cameras`` doesn't hit stale references.
+        """
+        self.left_arm.connect(calibrate)
+        self.right_arm.connect(calibrate)
+        self.cameras = {
+            **self.left_arm.cameras,
+            **self.right_arm.cameras,
+        }

@@ -65,8 +65,22 @@ class OpenArmFollowerNoAutoZero(OpenArmFollower):
             )
             self.calibrate()
 
-        for cam in self.cameras.values():
-            cam.connect()
+        # Open cameras individually. A missing / unplugged camera must
+        # not prevent the arm from being usable — the UI can still run
+        # on motor state alone. We log each failure and drop the dead
+        # camera from self.cameras so downstream code (get_observation,
+        # bimanual.cameras aggregate, etc.) doesn't try to read from it.
+        dead_cams = []
+        for name, cam in self.cameras.items():
+            try:
+                cam.connect()
+            except Exception as e:
+                logger.warning(
+                    f"Camera {name!r} failed to open ({e}). Continuing without it."
+                )
+                dead_cams.append(name)
+        for name in dead_cams:
+            self.cameras.pop(name, None)
 
         self.configure()
 
