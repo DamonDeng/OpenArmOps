@@ -55,12 +55,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class JointTrajectory:
-    """Linear trajectory in joint space, time-indexed in worker ticks."""
+    """Linear trajectory in joint space, time-indexed in worker ticks.
+
+    The trajectory owns a wall-clock ``last_updated`` timestamp used by
+    the staleness check: if we haven't touched it for STALENESS_SEC we
+    assume the user stopped caring and a future set_target should
+    rebuild from the motor's actual current position instead of
+    extending. This prevents a very old trajectory from suddenly
+    becoming active again and lurching the arm.
+    """
     start_deg: float
     target_deg: float
     total_steps: int
     elapsed_steps: int = 0
     deg_per_tick: float = 0.0
+    last_updated: float = 0.0   # time.perf_counter() of last touch
 
     @classmethod
     def new(cls, start: float, target: float, deg_per_sec: float, hz: int) -> "JointTrajectory":
@@ -69,7 +78,8 @@ class JointTrajectory:
             # Already there (or degenerate speed): a one-tick trajectory.
             # Setpoint snaps to target on the very next tick.
             return cls(start_deg=start, target_deg=target, total_steps=1,
-                       elapsed_steps=0, deg_per_tick=0.0)
+                       elapsed_steps=0, deg_per_tick=0.0,
+                       last_updated=time.perf_counter())
         total = max(1, int(math.ceil(dist * hz / deg_per_sec)))
         sign = 1.0 if target > start else -1.0
         return cls(
@@ -78,6 +88,7 @@ class JointTrajectory:
             total_steps=total,
             elapsed_steps=0,
             deg_per_tick=sign * deg_per_sec / hz,
+            last_updated=time.perf_counter(),
         )
 
     def setpoint(self) -> float:
@@ -92,6 +103,65 @@ class JointTrajectory:
 
     def is_done(self) -> bool:
         return self.elapsed_steps >= self.total_steps
+
+    # ------------------------------------------------------------------
+    # Target-extension path — avoids rebuilding from motor current on
+    # every set_target call, which otherwise pins the commanded setpoint
+    # close to the lagging motor under held-key auto-repeat.
+    # ------------------------------------------------------------------
+    def extends_in_same_direction(self, new_target: float) -> bool:
+        """True iff ``new_target`` is further along the motion we're
+        already doing. If the trajectory has effectively completed
+        (elapsed >= total), we treat any new target as an extension
+        when its direction matches our last sign; otherwise use the
+        un-reached target as reference.
+        """
+        if self.deg_per_tick == 0.0:
+            # Previous trajectory was degenerate (already at target);
+            # any new target is equivalent to a fresh direction.
+            return False
+        sign = 1.0 if self.deg_per_tick > 0.0 else -1.0
+        # Where is the commanded setpoint heading? If new_target is on
+        # the same side as sign relative to target_deg, we're extending.
+        # Edge case: new_target exactly equal to target_deg — harmless
+        # to treat as extension (zero-distance extend).
+        if sign > 0:
+            return new_target >= self.target_deg
+        else:
+            return new_target <= self.target_deg
+
+    def extend_target(self, new_target: float, deg_per_sec: float, hz: int) -> None:
+        """Update target in-place, preserving elapsed_steps + start_deg so
+        the time-based setpoint march continues from where it was.
+        ``deg_per_tick`` is re-derived from the (possibly changed) speed
+        setting but keeps the same sign.
+        """
+        self.target_deg = new_target
+        self.last_updated = time.perf_counter()
+        if deg_per_sec <= 0:
+            # No motion; let setpoint() clamp to target on the next tick.
+            self.deg_per_tick = 0.0
+            return
+
+        sign = 1.0 if self.deg_per_tick >= 0.0 else -1.0
+        # Recompute deg_per_tick so speed changes from the System tab
+        # take effect immediately on held-key accumulation.
+        self.deg_per_tick = sign * deg_per_sec / hz
+
+        # Recompute total_steps from the current setpoint, not start,
+        # so we don't pre-mark the trajectory "done" just because start
+        # is now far behind. Setpoint() returns target once
+        # elapsed >= total, so we count future ticks only.
+        cur_setpoint = self.setpoint()
+        remaining_dist = abs(new_target - cur_setpoint)
+        if remaining_dist < 1e-4:
+            # Already at (new) target — make the trajectory report done.
+            self.total_steps = self.elapsed_steps
+            return
+        remaining_ticks = max(1, int(math.ceil(remaining_dist * hz / deg_per_sec)))
+        # Total is "current elapsed" + "ticks still needed". Don't reset
+        # elapsed so setpoint() keeps counting from start_deg.
+        self.total_steps = self.elapsed_steps + remaining_ticks
 
 
 @dataclass
@@ -447,6 +517,40 @@ class MotionWorker(QThread):
                 self.send_error.emit(str(e))
 
     # ------------------------------------------------------------------
+    # Trajectory update helper
+    # ------------------------------------------------------------------
+    def _set_joint_target(
+        self,
+        key: str,
+        current_deg: float,
+        new_target_deg: float,
+        deg_per_sec: float,
+    ) -> None:
+        """Update a joint's trajectory. If an existing trajectory is fresh
+        AND extends in the same direction as the new target, we update it
+        in-place so held-key auto-repeat accumulates motion instead of
+        resetting the setpoint to current motor position every keystroke.
+        Otherwise rebuild from the motor's actual current position.
+        """
+        now = time.perf_counter()
+        existing = self._trajectories.get(key)
+        stale = (
+            existing is None
+            or (now - existing.last_updated) > config.TRAJECTORY_STALENESS_SEC
+        )
+        if (not stale and existing is not None
+                and existing.extends_in_same_direction(new_target_deg)):
+            existing.extend_target(new_target_deg, deg_per_sec=deg_per_sec,
+                                   hz=config.MOTION_HZ)
+        else:
+            self._trajectories[key] = JointTrajectory.new(
+                start=current_deg,
+                target=new_target_deg,
+                deg_per_sec=deg_per_sec,
+                hz=config.MOTION_HZ,
+            )
+
+    # ------------------------------------------------------------------
     # Cartesian mode
     # ------------------------------------------------------------------
     def _cartesian_tick(self, arm: str, current: dict[str, float]) -> None:
@@ -499,35 +603,25 @@ class MotionWorker(QThread):
 
         self._last_ik_q_deg[arm] = list(result.q_deg)
 
-        # Write the IK-produced joint angles as new targets. Each joint's
-        # trajectory is rebuilt with the current motor position as start
-        # (so the ramp respects whatever the motor currently reads). The
-        # existing joint-space ramp takes over from here.
+        # Route IK's joint targets through the shared helper so the
+        # per-tick IK updates also get the extend-in-same-direction
+        # treatment (otherwise holding a cartesian jog key would hit
+        # the same accumulation bug as the joint-space path).
+        speed = self.runtime.max_speed_deg_per_sec
         for i in range(7):
             joint = f"joint_{i+1}"
             key = f"{arm}_{joint}.pos"
             cur = current.get(key)
             if cur is None:
                 continue
-            self._trajectories[key] = JointTrajectory.new(
-                start=float(cur),
-                target=float(result.q_deg[i]),
-                deg_per_sec=self.runtime.max_speed_deg_per_sec,
-                hz=config.MOTION_HZ,
-            )
+            self._set_joint_target(key, float(cur), float(result.q_deg[i]), speed)
 
-        # Gripper is not part of IK; if target specifies one, build a
-        # joint trajectory for it directly.
+        # Gripper is not part of IK; if target specifies one, send it too.
         if target.gripper is not None:
             key = f"{arm}_gripper.pos"
             cur = current.get(key)
             if cur is not None:
-                self._trajectories[key] = JointTrajectory.new(
-                    start=float(cur),
-                    target=float(target.gripper),
-                    deg_per_sec=self.runtime.max_speed_deg_per_sec,
-                    hz=config.MOTION_HZ,
-                )
+                self._set_joint_target(key, float(cur), float(target.gripper), speed)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -556,12 +650,8 @@ class MotionWorker(QThread):
                     if cmd.deg_per_sec is not None
                     else self.runtime.max_speed_deg_per_sec
                 )
-                self._trajectories[key] = JointTrajectory.new(
-                    start=cur,
-                    target=float(cmd.target_deg),
-                    deg_per_sec=speed,
-                    hz=config.MOTION_HZ,
-                )
+                new_target = float(cmd.target_deg)
+                self._set_joint_target(key, cur, new_target, speed)
             elif cmd.kind == "torque":
                 self.robot.set_torque(cmd.arm, bool(cmd.torque_enabled))
                 self._torque_on[cmd.arm] = bool(cmd.torque_enabled)

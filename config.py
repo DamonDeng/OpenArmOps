@@ -94,6 +94,12 @@ GRAVITY_COMP_SCALE_STEP = 0.05
 # hitting something) and bounds the error seen by MIT control.
 LEAD_CAP_DEG = 10.0
 
+# Trajectory staleness. If a joint's trajectory was last touched longer
+# ago than this, a new set_target rebuilds from current motor position
+# rather than extending the old trajectory. Prevents an ancient target
+# from resuming when the user picks the arm back up after a pause.
+TRAJECTORY_STALENESS_SEC = 0.5
+
 # Per-keypress target nudge in degrees. Shift is used as a layer selector
 # (shoulder vs elbow/rotation), not as a coarse-speed modifier; every
 # nudge is the same size. Hold a key → OS key-repeat advances the target
