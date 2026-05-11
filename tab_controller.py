@@ -151,8 +151,15 @@ def _limits_for(arm: str, joint: str) -> tuple[float, float]:
 
 
 class _KeyboardFilter(QObject):
-    """Application-level event filter that converts key presses into target
-    nudges. Active only when the user's master toggle is on.
+    """Application-level event filter that tracks the set of currently-held
+    keys. The actual firing of bindings happens in ControllerTab's own
+    QTimer (see ``_fire_held_keys``); this filter only maintains the set.
+
+    Design rationale: OS key-repeat normally fires only the *most recently
+    pressed* key in a rapid stream, which means holding `e` + `f`
+    simultaneously would usually only auto-repeat `f`. For simultaneous
+    multi-joint control we need to fire each held key's binding once per
+    timer tick ourselves.
     """
 
     def __init__(self, tab: "ControllerTab") -> None:
@@ -160,83 +167,67 @@ class _KeyboardFilter(QObject):
         self.tab = tab
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
-        if event.type() != QEvent.KeyPress:
+        et = event.type()
+
+        # Reset held state when our window loses focus so a key stuck in
+        # the "held" set because a modal dialog grabbed focus (or an
+        # alt-tab consumed the release event) can't keep firing when we
+        # return.
+        if et == QEvent.WindowDeactivate:
+            self.tab._clear_held_keys()
+            return False
+
+        if et not in (QEvent.KeyPress, QEvent.KeyRelease):
             return False
         if not self.tab.keyboard_enabled:
             return False
         ke: QKeyEvent = event  # type: ignore[assignment]
 
-        # Debug-only: verify what Qt is handing us. Uses Qt's key code rather
-        # than text() because Ctrl+letter sometimes produces empty text() on
-        # some platforms (the OS intercepts the text-producing step).
+        # Auto-repeat events are synthetic — we ignore them because we
+        # run our own periodic timer. Real press/release events still
+        # update the held set.
+        if ke.isAutoRepeat():
+            # For KeyPress auto-repeat we still consume so the default
+            # widget doesn't also receive the repeat (e.g. a spinbox
+            # would treat it as typing).
+            return et == QEvent.KeyPress
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"KeyPress key=0x{ke.key():X} text={ke.text()!r} "
+                f"{et} key=0x{ke.key():X} text={ke.text()!r} "
                 f"mods=0x{int(ke.modifiers()):X} obj={type(obj).__name__}"
             )
 
+        # Resolve key character (falling back to key-code for Ctrl+letter
+        # which strips text() on X11).
         text = ke.text()
         ch = text[0].lower() if text else ""
-
-        # Ctrl+letter often arrives with an empty/control text on Linux
-        # (the X server's keysym processing strips the printable char).
-        # Fall back to Qt's key code: Qt.Key_A == 0x41, case-independent.
         if not ch or not ch.isalpha():
             k = ke.key()
-            # Accept only the A-Z range we actually bind.
             if Qt.Key_A <= k <= Qt.Key_Z:
                 ch = chr(ord("a") + (k - Qt.Key_A))
             else:
                 return False
 
-        # If focus is on a text-entry widget (e.g. a spinbox), don't steal
-        # the key — the user is probably editing a number. A cheap check:
-        # the widget accepts text input if it is QAbstractSpinBox / QLineEdit.
-        # We lean on the widget's own signaling by checking focusWidget.
+        # If focus is on a text-entry widget, let the widget handle it.
         fw = QApplication.focusWidget()
         if fw is not None:
-            # QAbstractSpinBox and QLineEdit both consume text keys normally.
             from PyQt5.QtWidgets import QAbstractSpinBox, QLineEdit
             if isinstance(fw, (QAbstractSpinBox, QLineEdit)):
                 return False
 
-        # Map Qt's modifier flags to our string modifier. Exactly one of
-        # shift/ctrl/alt may be held; any combination (or any other
-        # modifier such as Meta/Super) produces "ignore" so the user's
-        # intent stays unambiguous.
-        mods = ke.modifiers()
-        shift = bool(mods & Qt.ShiftModifier)
-        ctrl = bool(mods & Qt.ControlModifier)
-        alt = bool(mods & Qt.AltModifier)
-        held = int(shift) + int(ctrl) + int(alt)
-        if held > 1:
-            return False
-        if shift:
-            modifier = "shift"
-        elif ctrl:
-            modifier = "ctrl"
-        elif alt:
-            modifier = "alt"
-        else:
-            modifier = "none"
+        if et == QEvent.KeyPress:
+            # Remember that this letter is currently held. Modifier state
+            # is re-read fresh every timer tick, not at press time — that
+            # way "press e, then press Shift" picks up the new modifier
+            # without waiting for release/re-press.
+            self.tab._held_keys.add(ch)
+            # Consume so the default widget doesn't also process it.
+            return True
 
-        # Look up in both mode tables; the one whose arm is actually in
-        # that mode wins. If neither matches the current mode of its arm,
-        # no binding fires.
-        lookup_key = (ch, modifier)
-        tables = self.tab.bindings
-        joint_hit = tables.joint.get(lookup_key)
-        cart_hit = tables.cartesian.get(lookup_key)
-
-        for hit in (joint_hit, cart_hit):
-            if hit is None:
-                continue
-            if self.tab.worker.current_mode(hit.arm) != hit.mode:
-                continue
-            self.tab._apply_key_nudge(hit)
-            return True  # consume
-
-        return False
+        # KeyRelease
+        self.tab._held_keys.discard(ch)
+        return True
 
 
 class ControllerTab(QWidget):
@@ -262,14 +253,21 @@ class ControllerTab(QWidget):
 
         # Keyboard bindings — reloadable at runtime via the System-tab
         # button. Default to the bindings file loaded at startup; if that
-        # failed we fall through with an empty dict (the filter just
-        # returns False for every key).
+        # failed we fall through with empty tables so the filter just
+        # ignores every key.
         try:
-            self.bindings: dict[str, Binding] = load_bindings()
+            self.bindings: BindingTable = load_bindings()
         except Exception as e:
             logger.error(f"key bindings load failed: {e}")
-            self.bindings = {}
+            from .key_bindings import BindingTable as _BT
+            self.bindings = _BT(joint={}, cartesian={})
         self.keyboard_enabled: bool = True
+
+        # Currently-held letter keys. Populated by _KeyboardFilter on
+        # genuine press/release events (auto-repeat is ignored). A timer
+        # in this class iterates this set at KEY_TIMER_HZ to apply
+        # nudges, allowing simultaneous multi-key input.
+        self._held_keys: set[str] = set()
 
         root = QVBoxLayout(self)
 
@@ -359,11 +357,22 @@ class ControllerTab(QWidget):
         # Installed on the QApplication so key presses work from any tab
         # (the user wanted app-level capture when the toggle is on). Kept
         # on this tab as an instance attribute so it's GC-safe for the
-        # whole lifetime of the UI.
+        # whole lifetime of the UI. Filter only tracks press/release;
+        # bindings are fired by _kb_timer below.
         self._kb_filter = _KeyboardFilter(self)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self._kb_filter)
+
+        # ── Keyboard firing timer ───────────────────────────────────
+        # 30 Hz scan of _held_keys: each held letter's binding fires once
+        # per tick. Conflict-detect keys that would command the same
+        # (arm, joint|axis) in opposite directions and silently drop
+        # just those — non-conflicting held keys in the same tick still
+        # fire, so e.g. `e + f` drives j1 and j2 simultaneously.
+        self._kb_timer = QTimer(self)
+        self._kb_timer.timeout.connect(self._fire_held_keys)
+        self._kb_timer.start(int(1000 / 30))
 
     # ------------------------------------------------------------------
     # Layout
@@ -482,8 +491,84 @@ class ControllerTab(QWidget):
     # ------------------------------------------------------------------
     # Keyboard
     # ------------------------------------------------------------------
+    def _clear_held_keys(self) -> None:
+        """Drop any keys we thought were held. Called when the app window
+        loses focus so a key whose release event we never saw (because
+        focus moved to another window) stops firing when we return.
+        """
+        if self._held_keys:
+            logger.debug(f"window deactivated; clearing held keys {self._held_keys}")
+            self._held_keys.clear()
+
+    def _fire_held_keys(self) -> None:
+        """Called at 30 Hz. For every held letter, resolve its binding
+        (joint-mode or cartesian-mode based on the target arm's current
+        mode), detect conflicts (same target, opposite directions) and
+        drop only the conflicting keys, then apply the rest.
+        """
+        if not self.keyboard_enabled or not self._held_keys:
+            return
+
+        # Re-read modifier state each tick so "press e then press Shift"
+        # picks up the new modifier without needing to re-press e.
+        mods = QApplication.keyboardModifiers()
+        shift = bool(mods & Qt.ShiftModifier)
+        ctrl = bool(mods & Qt.ControlModifier)
+        alt = bool(mods & Qt.AltModifier)
+        held_count = int(shift) + int(ctrl) + int(alt)
+        if held_count > 1:
+            return  # multi-modifier = ambiguous, ignore as agreed
+        if shift:
+            modifier = "shift"
+        elif ctrl:
+            modifier = "ctrl"
+        elif alt:
+            modifier = "alt"
+        else:
+            modifier = "none"
+
+        # Resolve every held letter to its binding (or drop it if no
+        # binding matches the current modifier or the target-arm's mode).
+        resolved: list[Binding] = []
+        tables = self.bindings
+        for ch in list(self._held_keys):  # list() so we can tolerate mutation
+            lookup_key = (ch, modifier)
+            joint_hit = tables.joint.get(lookup_key)
+            cart_hit = tables.cartesian.get(lookup_key)
+            for hit in (joint_hit, cart_hit):
+                if hit is None:
+                    continue
+                if self.worker.current_mode(hit.arm) != hit.mode:
+                    continue
+                resolved.append(hit)
+                break
+
+        if not resolved:
+            return
+
+        # Conflict detection: group by (mode, arm, target). If a group has
+        # bindings of mixed signs, drop the whole group.
+        groups: dict[tuple[str, str, str], list[Binding]] = {}
+        for b in resolved:
+            groups.setdefault((b.mode, b.arm, b.target), []).append(b)
+
+        for group_key, group in groups.items():
+            signs = {b.direction for b in group}
+            if len(signs) > 1:
+                # Conflicting directions — drop this group only.
+                logger.debug(f"conflict on {group_key}: dropping {len(group)} binding(s)")
+                continue
+            # All bindings in group have the same sign. Firing one of
+            # them is sufficient (same target, same direction) — firing
+            # multiple would over-nudge the same target.
+            self._apply_key_nudge(group[0])
+
     def _on_kb_toggle(self, state: int) -> None:
         self.keyboard_enabled = bool(state == Qt.Checked)
+        # Drop any keys that were mid-press when the user toggled off,
+        # so toggling back on doesn't suddenly fire stale held keys.
+        if not self.keyboard_enabled:
+            self._clear_held_keys()
         self._refresh_kb_status_label()
         logger.info(f"keyboard control: {'on' if self.keyboard_enabled else 'off'}")
 
