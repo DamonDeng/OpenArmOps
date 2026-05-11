@@ -107,6 +107,30 @@ TRAJECTORY_STALENESS_SEC = 0.5
 SESSION_CONFIG_DIR = Path.home() / ".openarm_ui_config"
 SESSION_CONFIG_PATH = SESSION_CONFIG_DIR / "motion_settings.json"
 
+# ── VR input (Pico 4 Ultra APK over UDP) ──────────────────────────────
+# The openarmx_teleop_vr_apk APK streams controller + head poses to
+# this port as ASCII-space-delimited datagrams. The protocol is one
+# message per UDP packet, first token is message type (LEFT / RIGHT /
+# HEAD / MODE / CALIBRATE_DONE), remaining tokens are positional floats
+# or flags. See vr_input.py for the parser.
+VR_UDP_BIND_ADDR = "0.0.0.0"
+VR_UDP_PORT = 5100
+
+# Sensor noise dead-bands — applied when the motion worker eventually
+# consumes controller deltas. Small thresholds to stop the arm from
+# chasing sensor jitter at rest.
+VR_DEAD_BAND_POS_M = 0.002   # 2 mm
+VR_DEAD_BAND_ROT_RAD = 0.02  # ~1.1°
+
+# Stream freshness: if no packet arrived in this long, we treat the
+# stream as stale in the UI and (later) freeze any VR-driven arms.
+VR_STALE_SEC = 1.0
+
+# Grip threshold: above this, the controller is "enabled" (dead-man
+# engaged). Below this, its data is ignored by any motor-side logic.
+# Only relevant in Phase 2b; Phase 2a just displays the raw value.
+VR_GRIP_ENABLE_THRESHOLD = 0.5
+
 # Per-keypress target nudge in degrees. Shift is used as a layer selector
 # (shoulder vs elbow/rotation), not as a coarse-speed modifier; every
 # nudge is the same size. Hold a key → OS key-repeat advances the target

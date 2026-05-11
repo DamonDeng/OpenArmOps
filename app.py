@@ -31,6 +31,8 @@ from .session_config import load_session
 from .tab_cartesian import CartesianTab
 from .tab_controller import ControllerTab
 from .tab_system import SystemTab
+from .tab_vr import VRTab
+from .vr_input import VRInputReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -41,23 +43,27 @@ class MainWindow(QMainWindow):
         robot: RobotService,
         state: RuntimeState,
         worker: MotionWorker,
+        vr_receiver: VRInputReceiver,
     ) -> None:
         super().__init__()
         self.robot = robot
         self.state = state
         self.worker = worker
+        self.vr_receiver = vr_receiver
         self.setWindowTitle("OpenArm Controller (LeRobot direct)")
         self.resize(1200, 800)
 
         tabs = QTabWidget()
         self.controller_tab = ControllerTab(robot, state, worker)
         self.cartesian_tab = CartesianTab(robot, worker)
+        self.vr_tab = VRTab(vr_receiver)
         # System tab gets a reference to the controller tab so its
         # "Reload key bindings" button can reach into ControllerTab's
         # bindings dict.
         self.system_tab = SystemTab(robot, state, self.controller_tab)
         tabs.addTab(self.controller_tab, "Controller (movej)")
         tabs.addTab(self.cartesian_tab, "Cartesian (movel)")
+        tabs.addTab(self.vr_tab, "VR")
         tabs.addTab(self.system_tab, "System")
         self.setCentralWidget(tabs)
 
@@ -87,6 +93,9 @@ class MainWindow(QMainWindow):
         self._connection_label.setText(text)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        logger.info("Window close: stopping VR receiver…")
+        self.vr_receiver.stop()
+        self.vr_receiver.wait(1000)
         logger.info("Window close: stopping motion worker…")
         self.worker.stop()
         self.worker.wait(2000)  # 2 s to let current tick drain
@@ -138,7 +147,11 @@ def main() -> int:
             logger.error(f"Failed to load session config: {e}. Using defaults.")
     worker = MotionWorker(robot, state)
     worker.start()
-    window = MainWindow(robot, state, worker)
+
+    vr_receiver = VRInputReceiver()
+    vr_receiver.start()
+
+    window = MainWindow(robot, state, worker, vr_receiver)
     window.show()
     return app.exec_()
 
