@@ -846,31 +846,42 @@ class MotionWorker(QThread):
         )
         result: IKResult = solver.solve(pose, q_seed_deg_7=seed)
 
-        if not result.converged:
-            # Freeze — do not update trajectories. User sees no motion and
-            # (via the UI) gets a warning. Re-try next tick in case target
-            # moved back into reach.
+        # The strict 6-DOF solve might fail (request was unreachable at
+        # the requested orientation) but the position-priority fallback
+        # may still produce a usable solution by letting orientation
+        # drift. We freeze only when even the relaxed pass can't get
+        # close enough on POSITION — see IKResult.usable.
+        if not result.usable:
             if not self._ik_failed[arm]:
                 logger.warning(
-                    f"IK failed for {arm} arm: pos_err={result.pos_err_mm:.1f}mm "
-                    f"rot_err={result.rot_err_deg:.1f}° after {result.iters} iters. "
-                    "Arm will freeze until target becomes reachable."
+                    f"IK unusable for {arm} arm: pos_err={result.pos_err_mm:.1f}mm "
+                    f"rot_err={result.rot_err_deg:.1f}° "
+                    f"(position_priority_used={result.position_priority_used}, "
+                    f"iters={result.iters}). Arm freezes until target moves "
+                    "back into reach."
                 )
                 self.send_error.emit(f"{arm}: IK freeze — target unreachable")
             self._ik_failed[arm] = True
             return
 
-        # Converged. If the solution was clamped to joint limits the TCP
-        # error may be non-negligible; warn once per transition.
+        # Result is usable. position_priority_used=True is the expected
+        # path for many "push along one axis" teleop motions — it's not
+        # a failure mode; it just means the wrist orientation drifted
+        # from the commanded value to let position match. We DON'T set
+        # _ik_failed for this — the arm is moving correctly; the only
+        # subtle thing is the wrist isn't exactly tracking commanded
+        # rotation. Logged once per state transition for visibility.
         if result.clamped:
             if not self._ik_failed[arm]:
                 logger.warning(f"{arm}: IK solution clamped to joint limits")
                 self.send_error.emit(f"{arm}: IK solution clamped to joint limits")
             self._ik_failed[arm] = True
         else:
+            # Healthy: either strict converged, or position-priority
+            # found a usable solution. Clear any stale warning.
             if self._ik_failed[arm]:
                 logger.info(f"{arm}: IK recovered")
-                self.send_error.emit("")  # clear warning
+                self.send_error.emit("")
             self._ik_failed[arm] = False
 
         self._last_ik_q_deg[arm] = list(result.q_deg)
