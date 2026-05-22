@@ -131,6 +131,60 @@ VR_STALE_SEC = 1.0
 # Only relevant in Phase 2b; Phase 2a just displays the raw value.
 VR_GRIP_ENABLE_THRESHOLD = 0.5
 
+# Translation axis remap between the Pico/Unity OpenXR world frame
+# (+X right, +Y up, +Z forward, left-handed) and our robot world frame
+# (+X forward, +Y left, +Z up). Applied per-arm as:
+#
+#     delta_robot = VR_TRANSLATION_REMAP_<ARM> @ delta_vr
+#
+# The openarmx_teleop_vr project's teleop_params.yaml uses the same
+# matrix for both arms. We keep them separate because live hardware
+# testing has already shown one axis needs a different sign on the
+# right arm — the left/right direction was reversed on the right arm
+# only (moving the right controller right caused the right arm to
+# move left in robot frame).
+#
+# LEFT arm — openarmx default, not yet hardware-verified axis-by-axis:
+#   robot_x = -vr_z
+#   robot_y = -vr_x
+#   robot_z = +vr_y
+VR_TRANSLATION_REMAP_LEFT = (
+    ( 0.0,  0.0, -1.0),
+    (-1.0,  0.0,  0.0),
+    ( 0.0,  1.0,  0.0),
+)
+
+# RIGHT arm — same as left except Y row sign flipped to fix the
+# "push right controller right, right arm moves toward body" bug
+# found on hardware. User confirmed: with this flip, pushing the
+# right controller to the user's right should now move the right
+# arm to the robot's right.
+#   robot_x = -vr_z
+#   robot_y = +vr_x   (flipped vs LEFT)
+#   robot_z = +vr_y
+VR_TRANSLATION_REMAP_RIGHT = (
+    ( 0.0,  0.0, -1.0),
+    ( 1.0,  0.0,  0.0),
+    ( 0.0,  1.0,  0.0),
+)
+
+# Rotation remap: identity for both arms for now. The openarmx config
+# uses identity orientation_matrix too, but their closed IK core
+# likely does a handedness flip internally (Unity is left-handed,
+# robotics is right-handed). If the wrist rotates in the wrong
+# direction on hardware, replace these with 3x3 matrices that flip
+# the relevant axis.
+VR_ROTATION_REMAP_LEFT = (
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+)
+VR_ROTATION_REMAP_RIGHT = (
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+)
+
 # Per-keypress target nudge in degrees. Shift is used as a layer selector
 # (shoulder vs elbow/rotation), not as a coarse-speed modifier; every
 # nudge is the same size. Hold a key → OS key-repeat advances the target

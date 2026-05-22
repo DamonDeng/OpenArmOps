@@ -724,8 +724,42 @@ class MotionWorker(QThread):
             v[3:] *= scale_rot
             delta = pin.exp(v)
 
+        # Apply the VR-to-robot axis remap. Per-arm matrices from config
+        # since physical testing showed the two arms need different
+        # Y-axis signs. Decomposing the delta into log space, remapping
+        # translation and rotation 3-vectors separately, and recomposing
+        # gives the component-wise flip we want without reasoning about
+        # SE3 similarity transforms.
+        delta = self._apply_vr_remap(arm, delta)
+
         target = snap.arm * delta
         self._apply_vr_cart_target(arm, target, gripper_target)
+
+    # Cached numpy versions of the remap matrices, one pair per arm.
+    # Built on first use and reused; reset to None to pick up config edits
+    # (rare — would require a process restart with current code).
+    _vr_remap_cache: "dict[str, tuple[np.ndarray, np.ndarray]]" = {}
+
+    def _apply_vr_remap(self, arm: str, delta: "pin.SE3") -> "pin.SE3":
+        """Apply the per-arm VR-to-robot axis remap to an SE3 delta."""
+        cache = MotionWorker._vr_remap_cache
+        if arm not in cache:
+            if arm == "left":
+                t_src = config.VR_TRANSLATION_REMAP_LEFT
+                r_src = config.VR_ROTATION_REMAP_LEFT
+            else:
+                t_src = config.VR_TRANSLATION_REMAP_RIGHT
+                r_src = config.VR_ROTATION_REMAP_RIGHT
+            cache[arm] = (
+                np.array(t_src, dtype=float),
+                np.array(r_src, dtype=float),
+            )
+        M_t, M_r = cache[arm]
+        v = pin.log(delta).vector
+        v_remapped = np.empty(6)
+        v_remapped[:3] = M_t @ v[:3]
+        v_remapped[3:] = M_r @ v[3:]
+        return pin.exp(v_remapped)
 
     def _controller_pose(self, state) -> "pin.SE3":
         """Build an SE3 from a ControllerState's position + quaternion."""
