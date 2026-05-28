@@ -290,6 +290,17 @@ class MotionWorker(QThread):
         self._vr_snapshot: dict[str, Optional[_VRSnapshot]] = {
             "left": None, "right": None,
         }
+        # Low-pass filter state for the controller pose, per arm. None
+        # means "no prior sample" (next packet seeds the filter). The
+        # filter advances each tick by EMA on translation and a slerp-
+        # like step on rotation; see _filter_pose.
+        self._vr_filt_pose: dict[str, Optional["pin.SE3"]] = {
+            "left": None, "right": None,
+        }
+        # Hysteretic dead-band state. Once we leave the dead-band ("OUT"
+        # threshold) we stay in moving until the delta drops below the
+        # IN threshold. Resets on snapshot.
+        self._vr_moving: dict[str, bool] = {"left": False, "right": False}
 
     # ------------------------------------------------------------------
     # UI-facing API — these only post to the queue, they don't touch state.
@@ -643,21 +654,21 @@ class MotionWorker(QThread):
 
         grip_engaged = state.grip >= config.VR_GRIP_ENABLE_THRESHOLD
 
-        # Build current controller SE3 from the raw datagram fields.
-        # APK sends quaternion in xyzw order; Pinocchio Quaternion takes
-        # (w, x, y, z). We construct from a rotation matrix via numpy
-        # to avoid any binding surprises.
-        ctrl_pose = self._controller_pose(state)
+        # Build current controller SE3 from the raw datagram fields,
+        # then run it through the per-arm low-pass filter so downstream
+        # math (snapshot delta, dead-band check) sees a smoothed signal.
+        ctrl_pose_raw = self._controller_pose(state)
+        ctrl_pose = self._filter_pose(arm, ctrl_pose_raw)
 
         if not grip_engaged:
             # Clutch released. Drop the snapshot (so the next engage
-            # gets a fresh baseline). Do NOT touch _cart_target — arm
-            # holds at whatever pose we last commanded, gripper holds
-            # at whatever value we last commanded (don't update from
-            # trigger here; see the gripper-gating note in the docstring).
+            # gets a fresh baseline). Reset the filter and the
+            # hysteresis flag so the next engagement starts clean.
             if self._vr_snapshot[arm] is not None:
                 logger.info(f"{arm}: VR clutch released")
             self._vr_snapshot[arm] = None
+            self._vr_filt_pose[arm] = None
+            self._vr_moving[arm] = False
             return
 
         # From here on the clutch is engaged. Compute the gripper target
@@ -688,16 +699,28 @@ class MotionWorker(QThread):
         # Apply to arm_snapshot: target = arm_snapshot * delta
         delta = snap.controller.actInv(ctrl_pose)
 
-        # Dead-band check on the delta. Use the SE3 components directly
+        # Hysteretic dead-band on the delta. We only START moving when
+        # the delta exceeds the OUT threshold, and only STOP moving
+        # when it falls below the IN threshold. This stops sub-mm
+        # sensor jitter from flipping us between "track delta" and
+        # "hold snapshot" tick by tick. Use the SE3 components directly
         # (NOT pin.log(delta)[:3] which is the screw-axis translation,
         # not the actual translation when the delta has rotation).
         trans_norm = float(np.linalg.norm(delta.translation))
         rot_norm = float(np.linalg.norm(pin.log3(delta.rotation)))
-        if (trans_norm < config.VR_DEAD_BAND_POS_M
-                and rot_norm < config.VR_DEAD_BAND_ROT_RAD):
-            # Entirely within dead-band; hold current target.
-            target = snap.arm  # effectively no motion from snapshot
-            self._apply_vr_cart_target(arm, target, gripper_target)
+        moving = self._vr_moving[arm]
+        if moving:
+            if (trans_norm < config.VR_DEAD_BAND_POS_M_IN
+                    and rot_norm < config.VR_DEAD_BAND_ROT_RAD_IN):
+                moving = False
+        else:
+            if (trans_norm > config.VR_DEAD_BAND_POS_M_OUT
+                    or rot_norm > config.VR_DEAD_BAND_ROT_RAD_OUT):
+                moving = True
+        self._vr_moving[arm] = moving
+        if not moving:
+            # Inside the dead-band; hold the arm at its snapshot.
+            self._apply_vr_cart_target(arm, snap.arm, gripper_target)
             return
 
         # Control-display gain — scale translation and rotation
@@ -799,6 +822,43 @@ class MotionWorker(QThread):
         ])
         t = np.array([state.tx, state.ty, state.tz], dtype=float)
         return pin.SE3(R, t)
+
+    def _filter_pose(self, arm: str, raw: "pin.SE3") -> "pin.SE3":
+        """One-pole low-pass on the controller pose, per arm.
+
+        Translation: standard EMA. Rotation: slerp-like step toward the
+        new sample by ``alpha`` of the geodesic distance, computed as
+        ``exp3(alpha * log3(R_new @ R_old.T)) @ R_old``.
+
+        Returns the filtered pose AND stores it as the new filter state.
+        First call after a None reset (snapshot drop, clutch release)
+        seeds the filter at ``raw`` and returns ``raw`` unchanged so we
+        don't lurch from an old sample.
+        """
+        alpha = config.VR_POSE_FILTER_ALPHA
+        if alpha >= 1.0:
+            self._vr_filt_pose[arm] = raw
+            return raw
+        prev = self._vr_filt_pose[arm]
+        if prev is None:
+            self._vr_filt_pose[arm] = raw
+            return raw
+        # Translation EMA.
+        t_new = (1.0 - alpha) * prev.translation + alpha * raw.translation
+        # Rotation slerp step: walk alpha of the way from prev.R to raw.R.
+        R_delta = raw.rotation @ prev.rotation.T
+        try:
+            w = pin.log3(R_delta)
+        except Exception:
+            # Numerical edge — log3 can fail on near-identity if R_delta
+            # has a tiny non-orthogonal residue. Fall back to raw.
+            self._vr_filt_pose[arm] = raw
+            return raw
+        R_step = pin.exp3(alpha * w)
+        R_new = R_step @ prev.rotation
+        filt = pin.SE3(R_new, t_new)
+        self._vr_filt_pose[arm] = filt
+        return filt
 
     def _apply_vr_cart_target(
         self,
@@ -993,6 +1053,8 @@ class MotionWorker(QThread):
                     self._mode[arm] = "joint"
                     self._cart_target[arm] = None
                     self._vr_snapshot[arm] = None
+                    self._vr_filt_pose[arm] = None
+                    self._vr_moving[arm] = False
                     logger.info(f"{arm}: VR control DISABLED; arm back to joint mode")
             elif cmd.kind == "estop":
                 for arm in ("left", "right"):
@@ -1021,6 +1083,8 @@ class MotionWorker(QThread):
                     self._ik_failed[arm] = False
                     self._vr_enabled[arm] = False
                     self._vr_snapshot[arm] = None
+                    self._vr_filt_pose[arm] = None
+                    self._vr_moving[arm] = False
                 logger.warning(
                     "motion worker: e-stop consumed; torque off; trajectories pinned; "
                     "gravity_comp_scale reset to 0; arms returned to joint mode; "

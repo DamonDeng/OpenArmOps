@@ -132,8 +132,25 @@ VR_UDP_PORT = 5100
 # Sensor noise dead-bands — applied when the motion worker eventually
 # consumes controller deltas. Small thresholds to stop the arm from
 # chasing sensor jitter at rest.
-VR_DEAD_BAND_POS_M = 0.002   # 2 mm
-VR_DEAD_BAND_ROT_RAD = 0.02  # ~1.1°
+#
+# Hysteretic dead-band: the arm enters "moving" when delta exceeds the
+# OUT threshold, and only stops moving once it falls below the IN
+# threshold. Without hysteresis, rate-of-change of jitter past a single
+# threshold causes the cart_target to flip between snapshot and live
+# delta tick by tick, making the motor command oscillate. _IN < _OUT.
+VR_DEAD_BAND_POS_M_OUT = 0.004   # 4 mm — must move this far to start tracking
+VR_DEAD_BAND_POS_M_IN  = 0.002   # 2 mm — drop below to settle back to snapshot
+VR_DEAD_BAND_ROT_RAD_OUT = 0.035 # ~2.0°
+VR_DEAD_BAND_ROT_RAD_IN  = 0.020 # ~1.1°
+
+# One-pole low-pass on the controller pose. Smooths sensor jitter
+# *before* the snapshot delta is computed so both the resting baseline
+# and the moving target inherit the same noise budget. Alpha is the
+# weight of the new sample at each motion tick; alpha=1.0 disables
+# filtering. At 30 Hz tick rate, alpha=0.4 gives ~50 ms time constant
+# — long enough to suppress single-frame APK jitter, short enough that
+# fast hand motion doesn't feel laggy.
+VR_POSE_FILTER_ALPHA = 0.4
 
 # Stream freshness: if no packet arrived in this long, we treat the
 # stream as stale in the UI and (later) freeze any VR-driven arms.
