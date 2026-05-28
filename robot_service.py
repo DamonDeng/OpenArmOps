@@ -247,17 +247,34 @@ class RobotService:
     def arm_config_snapshot(self, arm: str) -> dict | None:
         """Return a copy of the kp/kd/joint_limits the worker needs for MIT
         batches. Returned dict is safe to use without holding the lock.
+
+        Joint-limit overrides are applied here so the worker (IK seed +
+        MIT clipping) sees them, while the LeRobot package constants
+        and other consumers (e.g. the Controller tab's joint sliders)
+        stay untouched.
         """
         with self._lock:
             if not self._connected or self._robot is None:
                 return None
             src = self._robot.left_arm.config if arm == "left" else self._robot.right_arm.config
+            limits = dict(src.joint_limits)
+            # joint_1 (forward/backward shoulder rotation): the LeRobot
+            # default upper bound is +75°, but VR teleop tests on
+            # 2026-05-28 confirmed that "arm forward at shoulder height"
+            # tracking needs ~85-90°. Extending to 120° on both arms
+            # gives the IK solver room to find the elbow-near-straight
+            # branch when the operator points the controller forward.
+            # User-approved for both arms after the right-arm test
+            # showed clean tracking with the wider bound.
+            if "joint_1" in limits:
+                lo, _ = limits["joint_1"]
+                limits["joint_1"] = (lo, 120.0)
             return {
                 "position_kp": list(src.position_kp)
                 if isinstance(src.position_kp, list) else src.position_kp,
                 "position_kd": list(src.position_kd)
                 if isinstance(src.position_kd, list) else src.position_kd,
-                "joint_limits": dict(src.joint_limits),
+                "joint_limits": limits,
             }
 
     def get_motor_stats(self) -> dict | None:

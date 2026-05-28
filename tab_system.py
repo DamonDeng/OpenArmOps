@@ -15,9 +15,10 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractScrollArea,
+    QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -26,6 +27,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -39,6 +41,7 @@ from . import config as uiconfig
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 from .session_config import load_session, reset_to_defaults, save_session
+from .vr_input import VRInputReceiver
 
 # TYPE_CHECKING-only import to break a circular-import cycle: ControllerTab
 # imports from tab_system -> tab_system would import ControllerTab back. At
@@ -48,6 +51,15 @@ if TYPE_CHECKING:
     from .tab_controller import ControllerTab
 
 logger = logging.getLogger(__name__)
+
+
+def _format_bytes(n: int) -> str:
+    """Compact human-readable byte count for the recorder status line."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KiB"
+    return f"{n / (1024 * 1024):.2f} MiB"
 
 
 class _CalibWorker(QObject):
@@ -88,16 +100,31 @@ class SystemTab(QWidget):
         robot: RobotService,
         state: RuntimeState,
         controller_tab: "ControllerTab",
+        vr_receiver: VRInputReceiver,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.robot = robot
         self.state = state
         self.controller_tab = controller_tab
+        self.vr_receiver = vr_receiver
         self._thread: QThread | None = None
         self._worker: _CalibWorker | None = None
 
-        root = QVBoxLayout(self)
+        # Wrap everything in a scroll area so the tab is usable on
+        # short displays. Outer layout is just a single scroll area
+        # that takes the full tab; inner widget hosts the actual
+        # group boxes via the existing ``root`` QVBoxLayout.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        inner = QWidget()
+        scroll.setWidget(inner)
+        root = QVBoxLayout(inner)
 
         # ── Camera snapshots (diagnostic) ───────────────────────────
         snap_box = QGroupBox("Camera snapshots (diagnostic)")
@@ -109,6 +136,32 @@ class SystemTab(QWidget):
         self.snap_status.setStyleSheet("color: #484;")
         snap_layout.addWidget(self.snap_status)
         root.addWidget(snap_box)
+
+        # ── VR packet recording (diagnostic) ────────────────────────
+        # Off by default at startup. Toggle to capture every datagram
+        # the receiver sees into an in-memory buffer. "Save & clear"
+        # writes JSON Lines to ~/.openarm_ui_config/vr_recordings/ with
+        # an auto-generated timestamp filename and empties the buffer.
+        rec_box = QGroupBox("VR packet recording (diagnostic)")
+        rec_layout = QVBoxLayout(rec_box)
+        rec_btn_row = QHBoxLayout()
+        self.vr_rec_toggle = QCheckBox("Record VR packets")
+        self.vr_rec_toggle.setChecked(False)
+        self.vr_rec_toggle.toggled.connect(self._on_vr_record_toggled)
+        rec_btn_row.addWidget(self.vr_rec_toggle)
+        self.btn_vr_rec_save = QPushButton("Save && clear")
+        self.btn_vr_rec_save.setToolTip(
+            f"Write buffered packets to {uiconfig.VR_RECORDINGS_DIR} as a "
+            f"timestamped .jsonl file, then drop the in-memory buffer."
+        )
+        self.btn_vr_rec_save.clicked.connect(self._on_vr_record_save)
+        rec_btn_row.addWidget(self.btn_vr_rec_save)
+        rec_btn_row.addStretch(1)
+        rec_layout.addLayout(rec_btn_row)
+        self.vr_rec_status = QLabel("Recorder: OFF — 0 packets, 0 B")
+        self.vr_rec_status.setStyleSheet("color: #484;")
+        rec_layout.addWidget(self.vr_rec_status)
+        root.addWidget(rec_box)
 
         # ── Motion settings ────────────────────────────────────────────
         speed_box = QGroupBox("Motion settings (apply to both arms)")
@@ -134,6 +187,25 @@ class SystemTab(QWidget):
         self.gcomp_spin.setValue(self.state.gravity_comp_scale)
         self.gcomp_spin.valueChanged.connect(self._on_gravity_comp_changed)
         speed_form.addRow("Gravity comp scale:", self.gcomp_spin)
+
+        # VR control-display gains. Shared across both arms (one set of
+        # scalars applies to whichever arm is in VR mode at any moment).
+        self.vr_pos_spin = QDoubleSpinBox()
+        self.vr_pos_spin.setDecimals(2)
+        self.vr_pos_spin.setRange(uiconfig.VR_SCALE_MIN, uiconfig.VR_SCALE_MAX)
+        self.vr_pos_spin.setSingleStep(uiconfig.VR_SCALE_STEP)
+        self.vr_pos_spin.setValue(self.state.vr_pos_scale)
+        self.vr_pos_spin.valueChanged.connect(self._on_vr_pos_scale_changed)
+        speed_form.addRow("VR position gain:", self.vr_pos_spin)
+
+        self.vr_rot_spin = QDoubleSpinBox()
+        self.vr_rot_spin.setDecimals(2)
+        self.vr_rot_spin.setRange(uiconfig.VR_SCALE_MIN, uiconfig.VR_SCALE_MAX)
+        self.vr_rot_spin.setSingleStep(uiconfig.VR_SCALE_STEP)
+        self.vr_rot_spin.setValue(self.state.vr_rot_scale)
+        self.vr_rot_spin.valueChanged.connect(self._on_vr_rot_scale_changed)
+        speed_form.addRow("VR rotation gain:", self.vr_rot_spin)
+
         speed_outer.addWidget(speed_form_widget)
 
         # Save / Load / Reset persistence row.
@@ -291,6 +363,14 @@ class SystemTab(QWidget):
         self.state.gravity_comp_scale = float(value)
         logger.info(f"gravity comp scale set to {value:.2f}")
 
+    def _on_vr_pos_scale_changed(self, value: float) -> None:
+        self.state.vr_pos_scale = float(value)
+        logger.info(f"VR position gain set to {value:.2f}")
+
+    def _on_vr_rot_scale_changed(self, value: float) -> None:
+        self.state.vr_rot_scale = float(value)
+        logger.info(f"VR rotation gain set to {value:.2f}")
+
     def _sync_motion_spinboxes_from_state(self) -> None:
         """After load/reset, push state values back into the spinboxes
         without triggering their valueChanged slots (which would just
@@ -299,6 +379,8 @@ class SystemTab(QWidget):
         for spin, value in (
             (self.speed_spin, self.state.max_speed_deg_per_sec),
             (self.gcomp_spin, self.state.gravity_comp_scale),
+            (self.vr_pos_spin, self.state.vr_pos_scale),
+            (self.vr_rot_spin, self.state.vr_rot_scale),
         ):
             spin.blockSignals(True)
             spin.setValue(float(value))
@@ -348,6 +430,42 @@ class SystemTab(QWidget):
         self._sync_motion_spinboxes_from_state()
         fields = ", ".join(f"{k}={v:.2f}" for k, v in applied.items())
         self._set_motion_status(f"Reset to defaults: {fields}")
+
+    # ------------------------------------------------------------------
+    # VR packet recorder
+    # ------------------------------------------------------------------
+    def _on_vr_record_toggled(self, checked: bool) -> None:
+        self.vr_receiver.set_recording(bool(checked))
+        self._refresh_vr_record_status()
+
+    def _on_vr_record_save(self) -> None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = uiconfig.VR_RECORDINGS_DIR / f"vr_log_{ts}.jsonl"
+        try:
+            packets, byts = self.vr_receiver.save_and_clear(path)
+        except Exception as e:
+            logger.exception("VR save_and_clear failed")
+            QMessageBox.critical(self, "VR recording", f"Save failed: {e}")
+            return
+        if packets == 0:
+            QMessageBox.information(
+                self, "VR recording",
+                f"No packets buffered. Empty file written to:\n{path}",
+            )
+        else:
+            QMessageBox.information(
+                self, "VR recording",
+                f"Wrote {packets} packets ({_format_bytes(byts)}) to:\n"
+                f"{path}\n\nBuffer cleared.",
+            )
+        self._refresh_vr_record_status()
+
+    def _refresh_vr_record_status(self) -> None:
+        enabled, count, byts = self.vr_receiver.recording_stats()
+        prefix = "ON" if enabled else "OFF"
+        self.vr_rec_status.setText(
+            f"Recorder: {prefix} — {count} packets, {_format_bytes(byts)}"
+        )
 
     def _on_reload_bindings(self) -> None:
         ok, msg = self.controller_tab.reload_bindings()
@@ -427,6 +545,9 @@ class SystemTab(QWidget):
         return box
 
     def _refresh_motor_info(self) -> None:
+        # Piggyback the VR recorder live counter on this same 2 Hz tick.
+        self._refresh_vr_record_status()
+
         # Sync the gravity-comp spinbox in case the motion worker reset the
         # scale (e.g. on e-stop) while this tab was invisible. Cheap and
         # idempotent — setValue is a no-op when the value already matches.

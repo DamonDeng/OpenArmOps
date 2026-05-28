@@ -190,11 +190,6 @@ class _VRSnapshot:
     controller: "pin.SE3"
     arm: "pin.SE3"
 
-# Safety: if the Pico pose jumps by more than this in a single tick,
-# clamp the delta before applying. Guards against tracking glitches.
-_VR_MAX_TICK_TRANS_M = 0.10    # 10 cm
-_VR_MAX_TICK_ROT_RAD = math.radians(30.0)
-
 # Gripper physical range in degrees. From joint_limits: -65 = fully open,
 # 0 = fully closed. Trigger 0 → gripper -65; trigger 1 → gripper 0.
 _GRIPPER_DEG_OPEN = -65.0
@@ -631,23 +626,20 @@ class MotionWorker(QThread):
           - grip < threshold → clear snapshot (clutch disengaged).
             _cart_target stays at its last value → arm freezes in place.
 
-        Trigger drives the gripper independently: trigger released =
-        gripper open (-65°), trigger pulled = gripper closed (0°). Maps
-        linearly with no dead-man gating — the gripper can open/close
-        even when the clutch is released (consistent with "invisible
-        spring" behavior — you always have gripper control).
+        Gripper:
+          Trigger drives the gripper, but only while grip ≥ threshold.
+          When grip is released the APK keeps streaming synthetic
+          packets with trigger=0, so an unconditional trigger→gripper
+          path would snap the gripper open every time the user lets
+          go to reposition (dropping anything held). Gating gripper
+          updates on grip-engaged means the gripper holds its last
+          commanded value across clutch releases.
         """
         if self.vr_receiver is None:
             return
         state = self.vr_receiver.left() if arm == "left" else self.vr_receiver.right()
         if not state.has_ever_been_seen:
             return
-
-        # Trigger → gripper (no clutch gate).
-        trig = max(0.0, min(1.0, state.trigger))
-        gripper_target = (
-            _GRIPPER_DEG_OPEN + (_GRIPPER_DEG_CLOSED - _GRIPPER_DEG_OPEN) * trig
-        )
 
         grip_engaged = state.grip >= config.VR_GRIP_ENABLE_THRESHOLD
 
@@ -659,14 +651,22 @@ class MotionWorker(QThread):
 
         if not grip_engaged:
             # Clutch released. Drop the snapshot (so the next engage
-            # gets a fresh baseline). Do NOT clear _cart_target — arm
-            # holds at whatever pose we last commanded.
+            # gets a fresh baseline). Do NOT touch _cart_target — arm
+            # holds at whatever pose we last commanded, gripper holds
+            # at whatever value we last commanded (don't update from
+            # trigger here; see the gripper-gating note in the docstring).
             if self._vr_snapshot[arm] is not None:
                 logger.info(f"{arm}: VR clutch released")
             self._vr_snapshot[arm] = None
-            # Still update gripper independent of clutch.
-            self._update_gripper_only(arm, gripper_target)
             return
+
+        # From here on the clutch is engaged. Compute the gripper target
+        # only inside this branch so released-state synthetic packets
+        # (trigger=0) can't drive the gripper open.
+        trig = max(0.0, min(1.0, state.trigger))
+        gripper_target = (
+            _GRIPPER_DEG_OPEN + (_GRIPPER_DEG_CLOSED - _GRIPPER_DEG_OPEN) * trig
+        )
 
         if self._vr_snapshot[arm] is None:
             # Rising edge: take fresh snapshots. Controller pose = now.
@@ -686,51 +686,59 @@ class MotionWorker(QThread):
         snap = self._vr_snapshot[arm]
         # SE3 delta: delta = ctrl_snapshot^-1 * ctrl_now (in snapshot frame)
         # Apply to arm_snapshot: target = arm_snapshot * delta
-        # (Axis remap will eventually go here; identity for now.)
         delta = snap.controller.actInv(ctrl_pose)
 
-        # Dead-band check (applied to the delta, so noise below threshold
-        # contributes nothing). Translation from log is 6-vector; we
-        # inspect translation and rotation magnitudes separately.
-        delta_log = pin.log(delta).vector  # [vx, vy, vz, wx, wy, wz]
-        trans_norm = float(np.linalg.norm(delta_log[:3]))
-        rot_norm = float(np.linalg.norm(delta_log[3:]))
+        # Dead-band check on the delta. Use the SE3 components directly
+        # (NOT pin.log(delta)[:3] which is the screw-axis translation,
+        # not the actual translation when the delta has rotation).
+        trans_norm = float(np.linalg.norm(delta.translation))
+        rot_norm = float(np.linalg.norm(pin.log3(delta.rotation)))
         if (trans_norm < config.VR_DEAD_BAND_POS_M
                 and rot_norm < config.VR_DEAD_BAND_ROT_RAD):
-            # Entirely within dead-band; hold current target, update
-            # only the gripper (which has no dead-band).
+            # Entirely within dead-band; hold current target.
             target = snap.arm  # effectively no motion from snapshot
             self._apply_vr_cart_target(arm, target, gripper_target)
             return
 
-        # Safety clamp: if the delta is absurdly large in one tick
-        # (tracking glitch, Pico pose snap), clamp proportionally so we
-        # don't slam the arm. The ramp downstream also enforces speed,
-        # but it's safer to clamp at the source.
-        scale_trans = 1.0
-        if trans_norm > _VR_MAX_TICK_TRANS_M:
-            scale_trans = _VR_MAX_TICK_TRANS_M / trans_norm
-        scale_rot = 1.0
-        if rot_norm > _VR_MAX_TICK_ROT_RAD:
-            scale_rot = _VR_MAX_TICK_ROT_RAD / rot_norm
-        if scale_trans < 1.0 or scale_rot < 1.0:
-            logger.warning(
-                f"{arm}: VR delta clamped "
-                f"(trans {trans_norm*1000:.0f}mm scale {scale_trans:.2f}, "
-                f"rot {math.degrees(rot_norm):.0f}° scale {scale_rot:.2f})"
-            )
-            v = delta_log.copy()
-            v[:3] *= scale_trans
-            v[3:] *= scale_rot
-            delta = pin.exp(v)
+        # Control-display gain — scale translation and rotation
+        # *separately on the SE3 components*. The earlier
+        # log → scale → exp formulation was incorrect: pin.log(SE3)
+        # produces a screw-axis 6-vector whose translation part is
+        # NOT the SE3's translation when there's any rotation, so
+        # scaling the screw-axis translation distorts the trajectory
+        # whenever the controller is rotated (which is essentially
+        # always for a real human hand).
+        s_pos = float(self.runtime.vr_pos_scale)
+        s_rot = float(self.runtime.vr_rot_scale)
+        if s_pos != 1.0 or s_rot != 1.0:
+            t_scaled = delta.translation * s_pos if s_pos != 1.0 else delta.translation
+            if s_rot != 1.0:
+                # Scale rotation as an angle: log3 → scale axis*angle → exp3.
+                # log3/exp3 operate on SO(3) only, so they don't have the
+                # screw-axis coupling that breaks the SE3 form.
+                w = pin.log3(delta.rotation)
+                R_scaled = pin.exp3(w * s_rot)
+            else:
+                R_scaled = delta.rotation
+            delta = pin.SE3(R_scaled, t_scaled)
 
-        # Apply the VR-to-robot axis remap. Per-arm matrices from config
-        # since physical testing showed the two arms need different
-        # Y-axis signs. Decomposing the delta into log space, remapping
-        # translation and rotation 3-vectors separately, and recomposing
-        # gives the component-wise flip we want without reasoning about
-        # SE3 similarity transforms.
+        # Apply the VR-to-robot axis remap. Translation gets a direct
+        # matrix multiply; rotation gets a similarity transform.
         delta = self._apply_vr_remap(arm, delta)
+
+        # Compose the remapped delta as a world-frame motion of the
+        # snapshot, not as an EE-local motion. Pinocchio's `*` is
+        # left-action in body frame: (snap.arm * delta).t = snap.arm.t
+        # + snap.arm.R @ delta.t. For the right arm at home,
+        # snap.arm.R ≈ diag(1, -1, -1) (EE points down), so a
+        # world-frame "+up" delta would arrive at the EE as "-up".
+        # Re-express delta in body frame so that the world-frame
+        # composition target.t = snap.arm.t + delta.t holds:
+        #   body.t = snap.arm.R^T @ delta.t
+        #   body.R = snap.arm.R^T @ delta.R @ snap.arm.R
+        R_snap = snap.arm.rotation
+        delta = pin.SE3(R_snap.T @ delta.rotation @ R_snap,
+                        R_snap.T @ delta.translation)
 
         target = snap.arm * delta
         self._apply_vr_cart_target(arm, target, gripper_target)
@@ -741,7 +749,18 @@ class MotionWorker(QThread):
     _vr_remap_cache: "dict[str, tuple[np.ndarray, np.ndarray]]" = {}
 
     def _apply_vr_remap(self, arm: str, delta: "pin.SE3") -> "pin.SE3":
-        """Apply the per-arm VR-to-robot axis remap to an SE3 delta."""
+        """Apply the per-arm VR-to-robot axis remap to an SE3 delta.
+
+        Translation: t_new = M_t @ delta.translation (direct).
+        Rotation:    R_new = M_r @ delta.rotation @ M_r^T (similarity).
+
+        We deliberately do NOT use the log/scale/exp pattern: pin.log
+        on an SE3 with non-zero rotation produces a screw-axis
+        6-vector whose translation part is NOT the SE3 translation,
+        and applying a permutation matrix to it distorts the
+        trajectory. The component-wise math here is the
+        mathematically correct change of basis.
+        """
         cache = MotionWorker._vr_remap_cache
         if arm not in cache:
             if arm == "left":
@@ -755,11 +774,9 @@ class MotionWorker(QThread):
                 np.array(r_src, dtype=float),
             )
         M_t, M_r = cache[arm]
-        v = pin.log(delta).vector
-        v_remapped = np.empty(6)
-        v_remapped[:3] = M_t @ v[:3]
-        v_remapped[3:] = M_r @ v[3:]
-        return pin.exp(v_remapped)
+        t_new = M_t @ delta.translation
+        R_new = M_r @ delta.rotation @ M_r.T
+        return pin.SE3(R_new, t_new)
 
     def _controller_pose(self, state) -> "pin.SE3":
         """Build an SE3 from a ControllerState's position + quaternion."""
@@ -797,31 +814,6 @@ class MotionWorker(QThread):
         self._cart_target[arm] = CartesianTarget(
             x=x, y=y, z=z,
             roll=roll, pitch=pitch, yaw=yaw,
-            gripper=gripper_target_deg,
-        )
-
-    def _update_gripper_only(self, arm: str, gripper_target_deg: float) -> None:
-        """When clutch is released we still want the gripper to respond
-        to the trigger. Preserve whatever translation/rotation the last
-        cart_target had; just swap in the new gripper value.
-        """
-        prev = self._cart_target[arm]
-        if prev is None:
-            # No baseline pose — take one from FK so _cartesian_tick has
-            # something valid to consume. Rare: first tick after enable
-            # with clutch still off.
-            fk = self.compute_fk(arm)
-            if fk is None:
-                return
-            x, y, z, roll, pitch, yaw = pose_to_xyzrpy(fk)
-            self._cart_target[arm] = CartesianTarget(
-                x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw,
-                gripper=gripper_target_deg,
-            )
-            return
-        self._cart_target[arm] = CartesianTarget(
-            x=prev.x, y=prev.y, z=prev.z,
-            roll=prev.roll, pitch=prev.pitch, yaw=prev.yaw,
             gripper=gripper_target_deg,
         )
 

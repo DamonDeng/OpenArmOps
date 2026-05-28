@@ -1,7 +1,8 @@
 """UDP receiver for Pico 4 Ultra controller + head poses.
 
-Protocol (verified via tcpdump on 2026-05-11 against the openarmx_teleop_vr_apk
-v6 APK):
+Protocol (wire format verified via tcpdump on 2026-05-11 against the
+openarmx_teleop_vr_apk v6 APK; coordinate frame characterized via the
+2026-05-27 three-posture recording):
 
     Each datagram is one ASCII line, space-delimited, ending in newline
     optional. First token identifies the payload:
@@ -14,6 +15,14 @@ v6 APK):
 
     Translation metres, quaternion xyzw order, trigger/grip 0..1,
     A/B/X/Y 0 or 1. Rate is the on-controller slider 0..1.
+
+    Coordinate frame (right-handed, as the APK actually sends — this
+    is NOT the documented OpenXR "+Y up, +Z forward" convention):
+      +X = operator's right
+      +Y = forward (out from the operator's body)
+      +Z = up
+    Origin resets at each grip rising-edge. The vr→robot remap in
+    config.VR_TRANSLATION_REMAP_RIGHT depends on this.
 
 Design:
 - One QThread owns a non-blocking UDP socket bound to VR_UDP_PORT. Polls
@@ -32,6 +41,7 @@ directly in Phase 2b.
 
 from __future__ import annotations
 
+import json
 import logging
 import select
 import socket
@@ -39,6 +49,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -150,6 +161,19 @@ class VRInputReceiver(QThread):
         self._emit_interval = 0.1
         self._last_emit = 0.0
 
+        # Manual packet recorder. Off by default at startup — the user
+        # has to flip a toggle in the System tab to enable it. When
+        # enabled, every received datagram is appended to an in-memory
+        # buffer along with its arrival timestamp and source address.
+        # The buffer is bounded only by available memory; user is
+        # expected to "Save & clear" when finished. We keep the buffer
+        # behind its own lock so the UI's stats poll doesn't fight
+        # the receiver thread for self._lock.
+        self._record_enabled = False
+        self._record_lock = threading.Lock()
+        self._record_buffer: deque[tuple[float, str, bytes]] = deque()
+        self._record_bytes = 0  # cached size sum, kept in sync on append/clear
+
     # ------------------------------------------------------------------
     # Public read API — any thread can call these (they snapshot under
     # the lock to avoid torn reads of multi-field dataclasses).
@@ -175,6 +199,66 @@ class VRInputReceiver(QThread):
 
     def stop(self) -> None:
         self._stop = True
+
+    # ------------------------------------------------------------------
+    # Packet recorder — manual on/off, in-memory buffer, save-and-clear.
+    # ------------------------------------------------------------------
+    def set_recording(self, enabled: bool) -> None:
+        """Turn raw-packet recording on or off. Toggling does not touch
+        the existing buffer — turning off then on later resumes
+        appending to the same deque. Use ``save_and_clear`` to flush.
+        """
+        with self._record_lock:
+            self._record_enabled = bool(enabled)
+        logger.info(f"VR packet recording {'ENABLED' if enabled else 'DISABLED'}")
+
+    def recording_stats(self) -> tuple[bool, int, int]:
+        """Return ``(enabled, packet_count, total_bytes)`` for live UI
+        display. Cheap — just snapshots three counters under the lock.
+        """
+        with self._record_lock:
+            return self._record_enabled, len(self._record_buffer), self._record_bytes
+
+    def save_and_clear(self, path: Path) -> tuple[int, int]:
+        """Write the current buffer to ``path`` as JSON Lines, then drop
+        the in-memory buffer. Returns ``(packets_written, bytes_written)``.
+
+        Atomic swap pattern: under the lock we replace the buffer with
+        a fresh deque so the receiver thread can keep appending while
+        we serialize the snapshot to disk on the calling thread.
+
+        Format: one JSON object per line, fields:
+          - ``t``: monotonic seconds since the receiver started (float)
+          - ``from``: ``"ip:port"`` source address string
+          - ``raw``: the raw datagram body, decoded as ASCII with
+                     errors=replace (the wire format is space-delimited
+                     ASCII, so this is human-readable and round-trips
+                     for replay).
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._record_lock:
+            snapshot = self._record_buffer
+            self._record_buffer = deque()
+            self._record_bytes = 0
+
+        packets = len(snapshot)
+        if packets == 0:
+            path.write_text("", encoding="utf-8")
+            return 0, 0
+
+        bytes_written = 0
+        with path.open("w", encoding="utf-8") as f:
+            for t, source, raw in snapshot:
+                line = json.dumps({
+                    "t": round(t, 6),
+                    "from": source,
+                    "raw": raw.decode("ascii", errors="replace"),
+                }) + "\n"
+                f.write(line)
+                bytes_written += len(line.encode("utf-8"))
+        return packets, bytes_written
 
     # ------------------------------------------------------------------
     # Thread body
@@ -228,6 +312,17 @@ class VRInputReceiver(QThread):
         now = time.monotonic()
         size = len(data)
         source = f"{addr[0]}:{addr[1]}"
+
+        # Recorder hook: append the raw datagram (pre-parse) so the log
+        # captures every packet we received, even malformed ones. Cheap
+        # branch when disabled.
+        if self._record_enabled:
+            with self._record_lock:
+                # Re-check under the lock — set_recording could have
+                # flipped between the outer test and here.
+                if self._record_enabled:
+                    self._record_buffer.append((now, source, data))
+                    self._record_bytes += size
 
         try:
             line = data.decode("ascii", errors="replace").strip()

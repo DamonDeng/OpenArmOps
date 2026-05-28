@@ -18,3 +18,8 @@ key_bindings.local.json
 
 # Diagnostic snapshots from the Camera Snapshots button
 snapshots/
+
+# VR packet recordings copied for offline analysis. Reproducible from
+# the live recorder and large enough to bloat the repo, so we don't
+# commit them.
+vr_recordings_backup/

@@ -107,6 +107,11 @@ TRAJECTORY_STALENESS_SEC = 0.5
 SESSION_CONFIG_DIR = Path.home() / ".openarm_ui_config"
 SESSION_CONFIG_PATH = SESSION_CONFIG_DIR / "motion_settings.json"
 
+# VR recording artefacts. JSON Lines (one record per line) so the file
+# can be tailed live, grepped, and replayed by a future tool with
+# minimal parsing.
+VR_RECORDINGS_DIR = SESSION_CONFIG_DIR / "vr_recordings"
+
 # ── VR input (Pico 4 Ultra APK over UDP) ──────────────────────────────
 # The openarmx_teleop_vr_apk APK streams controller + head poses to
 # this port as ASCII-space-delimited datagrams. The protocol is one
@@ -128,8 +133,34 @@ VR_STALE_SEC = 1.0
 
 # Grip threshold: above this, the controller is "enabled" (dead-man
 # engaged). Below this, its data is ignored by any motor-side logic.
-# Only relevant in Phase 2b; Phase 2a just displays the raw value.
-VR_GRIP_ENABLE_THRESHOLD = 0.5
+# Set to 0.8 — empirically the APK appears to internally re-zero its
+# pose reference when grip drops past somewhere ~0.6, so by the time
+# our gate trips at 0.8 the APK has already reset and the very first
+# packet we treat as "engaged" carries pos≈0, quat≈identity. That
+# makes the snapshot we take coincide with the APK's reset, which
+# eliminates the few-mm-per-engagement offset we'd see at 0.5.
+# Same threshold gates the gripper trigger update — when grip is
+# below 0.8 the gripper holds its last commanded value rather than
+# snapping to whatever the trigger reads on the synthetic packets
+# the APK streams while grip is released.
+VR_GRIP_ENABLE_THRESHOLD = 0.8
+
+# Initial control-display gain. Multiplies the controller-to-arm
+# delta after frame remap so 1 cm of hand motion can drive less (or
+# more) cm of arm motion. Live-editable from the System tab; saved
+# alongside max_speed via session_config.json.
+# Default 0.7 because the OpenArm's reach (~60 cm from home) is smaller
+# than a natural human arm extension (~70-80 cm). At 1:1 the user can
+# trivially drive targets out of the workspace; at 0.7 a full-arm-reach
+# hand motion of 70 cm becomes an arm target ~50 cm from home, which
+# fits inside the reachable set with margin. Live-editable from the
+# System tab; users with cramped recordings can dial it back to 1.0.
+INITIAL_VR_POS_SCALE = 0.7  # translation gain; 1.0 = arm follows hand 1:1
+INITIAL_VR_ROT_SCALE = 1.0  # rotation gain; 1.0 = arm wrist follows hand 1:1
+# Spinbox bounds in the UI.
+VR_SCALE_MIN = 0.05
+VR_SCALE_MAX = 5.0
+VR_SCALE_STEP = 0.05
 
 # Translation axis remap between the Pico/Unity OpenXR world frame
 # (+X right, +Y up, +Z forward, left-handed) and our robot world frame
@@ -144,46 +175,56 @@ VR_GRIP_ENABLE_THRESHOLD = 0.5
 # only (moving the right controller right caused the right arm to
 # move left in robot frame).
 #
-# LEFT arm — openarmx default, not yet hardware-verified axis-by-axis:
-#   robot_x = -vr_z
-#   robot_y = -vr_x
-#   robot_z = +vr_y
-VR_TRANSLATION_REMAP_LEFT = (
-    ( 0.0,  0.0, -1.0),
-    (-1.0,  0.0,  0.0),
-    ( 0.0,  1.0,  0.0),
-)
+# LEFT arm — derived from a 4-posture LEFT controller recording on
+# 2026-05-28 (vr_log_20260528_140228). The phases were P1 (arm hanging,
+# wrist roll), P2 (arm forward → vr_y≈+0.67, vr_z≈+0.66), P3 (arm
+# pointing left → vr_x≈-0.62, vr_z≈+0.62), P4 (return to zero). The
+# left controller uses the SAME APK convention as the right
+# controller — there's no left/right asymmetry in the wire-format
+# frame. Both arms share the world frame
+# (+robot_x=forward, +robot_y=operator's left, +robot_z=up), so the
+# remap matrix is identical to the right-arm one.
+#   robot_x = +vr_y   (forward)
+#   robot_y = -vr_x   (operator's right → robot's -Y;
+#                       equivalently, operator's left → robot +Y)
+#   robot_z = +vr_z   (up)
 
-# RIGHT arm — same as left except Y row sign flipped to fix the
-# "push right controller right, right arm moves toward body" bug
-# found on hardware. User confirmed: with this flip, pushing the
-# right controller to the user's right should now move the right
-# arm to the robot's right.
-#   robot_x = -vr_z
-#   robot_y = +vr_x   (flipped vs LEFT)
-#   robot_z = +vr_y
+# RIGHT arm — derived from a 3-posture VR recording on 2026-05-27 and
+# verified in offline replay (tools/replay_vr_log_offline.py).
+#
+# What the APK actually sends (empirical, NOT the OpenXR convention
+# the vr_input.py docstring inherited from openarmx-teleop):
+#   +vr_x = operator's right
+#   +vr_y = forward (out from the body)
+#   +vr_z = up
+# The "+Y up, +Z forward" reading is what tripped up earlier remap
+# attempts; the 2026-05-27 recording's P3 (arm right, no forward)
+# pinned the convention down — vr_x went to +0.61, vr_y stayed near
+# zero, and vr_z went to +0.69, which only fits "y is forward, z is
+# up", not the documented OpenXR convention.
+#
+#   robot_x = +vr_y   (forward)
+#   robot_y = -vr_x   (operator's right → robot's -Y)
+#   robot_z = +vr_z   (up)
 VR_TRANSLATION_REMAP_RIGHT = (
-    ( 0.0,  0.0, -1.0),
-    ( 1.0,  0.0,  0.0),
     ( 0.0,  1.0,  0.0),
+    (-1.0,  0.0,  0.0),
+    ( 0.0,  0.0,  1.0),
 )
+VR_TRANSLATION_REMAP_LEFT = VR_TRANSLATION_REMAP_RIGHT
 
-# Rotation remap: identity for both arms for now. The openarmx config
-# uses identity orientation_matrix too, but their closed IK core
-# likely does a handedness flip internally (Unity is left-handed,
-# robotics is right-handed). If the wrist rotates in the wrong
-# direction on hardware, replace these with 3x3 matrices that flip
-# the relevant axis.
-VR_ROTATION_REMAP_LEFT = (
-    (1.0, 0.0, 0.0),
-    (0.0, 1.0, 0.0),
-    (0.0, 0.0, 1.0),
-)
-VR_ROTATION_REMAP_RIGHT = (
-    (1.0, 0.0, 0.0),
-    (0.0, 1.0, 0.0),
-    (0.0, 0.0, 1.0),
-)
+# Rotation remap: must encode the same axis permutation as the
+# translation remap above, otherwise translations and rotations end up
+# in different frames. Hardware test 2026-05-28 (right arm only):
+# with M_r=identity but M_t=swap(X,Y), pitching the controller forward
+# made the EE tip swing left/right instead of forward/back. Setting
+# M_r = M_t makes a controller rotation axis ω_vr map to a robot
+# rotation axis M_t @ ω_vr, matching how we map translations.
+#
+# Both arms share the same VR→robot translation remap (see above), so
+# the rotation remap is also the same for both arms.
+VR_ROTATION_REMAP_RIGHT = VR_TRANSLATION_REMAP_RIGHT
+VR_ROTATION_REMAP_LEFT = VR_TRANSLATION_REMAP_LEFT
 
 # Per-keypress target nudge in degrees. Shift is used as a layer selector
 # (shoulder vs elbow/rotation), not as a coarse-speed modifier; every

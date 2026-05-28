@@ -41,15 +41,21 @@ _POS_TOL = 1e-4      # 0.1 mm  — strict 6-DOF convergence
 _ROT_TOL = 1e-3      # ~0.06°  — strict 6-DOF convergence
 _STEP_ALPHA = 1.0    # full step per iteration
 
-# "Usable" tolerances — looser than strict convergence. A solution
-# whose position error is below this is good enough to send to the
-# motors, even if it didn't reach the strict convergence target.
-# Beyond _USABLE_POS_TOL we declare "freeze" and warn the caller.
-_USABLE_POS_TOL = 5e-3   # 5 mm position error — anything beyond and
-                         # we say the target is genuinely unreachable.
-_USABLE_ROT_TOL = math.radians(15.0)  # 15° — fairly loose, since
-                                      # position-priority deliberately
-                                      # lets rotation drift.
+# "Usable" tolerances. Position is the primary criterion — if the
+# arm got within this much of the requested position, the result
+# is "usable" and the caller should drive the motors. Rotation
+# tolerance is split into two bands depending on whether we used
+# the position-priority pass:
+#  - strict-only result: rot_err must be small (full 6-DOF success)
+#  - position-priority result: rotation deliberately abandoned, so
+#    we don't gate on it — just position and a generous safety
+#    ceiling so a fully-broken result still gets caught.
+_USABLE_POS_TOL = 5e-3                       # 5 mm position error
+_USABLE_ROT_TOL_STRICT = math.radians(15.0)  # 15° rot if strict was used
+_USABLE_ROT_TOL_RELAXED = math.radians(120.0)  # generous ceiling when
+                                                # position-priority is in
+                                                # play (only catches truly
+                                                # unreachable wrist poses)
 
 
 @dataclass
@@ -118,26 +124,20 @@ class CartesianIKSolver:
         return self.data.oMf[self._tcp_fid].copy()
 
     def solve(self, target_pose: pin.SE3, q_seed_deg_7: list[float]) -> IKResult:
-        """Solve IK for a single target with a strict-then-relaxed fallback.
+        """Solve IK for a single target. Position is the priority metric.
 
         Strategy:
-          1. Run strict 6-DOF damped least squares (existing behaviour). If
-             it converges to the tight (_POS_TOL, _ROT_TOL) thresholds,
-             return the result.
-          2. Otherwise, re-run from the strict pass's final q with
-             position-priority weighting — rotation rows of the error
-             vector are scaled down by _POSPRI_ROT_WEIGHT so the solver
-             trades wrist orientation for position match. This is what
-             handles "user nudged X by 1 cm but the requested orientation
-             can't be achieved at that X" — the wrist drifts off the
-             requested orientation but X is honoured.
-          3. Whichever pass produced the lower **position** error wins.
-             We then mark the result ``usable`` if the position error is
-             below _USABLE_POS_TOL — caller can act on the relaxed
-             solution rather than freezing the arm.
-
-        ``converged`` retains its old meaning (strict 6-DOF). Use
-        ``usable`` to decide whether to drive the motors.
+          1. Run strict 6-DOF damped least squares.
+          2. If strict's POSITION error is already within _USABLE_POS_TOL
+             AND its rotation error is within strict tolerance, that's
+             the best possible outcome — full 6-DOF success. Return.
+          3. Otherwise run the position-priority pass (3-row Jacobian,
+             4-D null space) from the original user seed.
+          4. Pick the pass with lower POSITION error. (Position is the
+             user's primary input — translations come from controller
+             deltas; rotation often comes along passively. We never
+             pick a result with a worse position just because its
+             rotation was a bit better.)
         """
         q = np.zeros(self.model.nq)
         for i, v in enumerate(q_seed_deg_7):
@@ -147,21 +147,26 @@ class CartesianIKSolver:
         q_strict, pos_err_strict, rot_err_strict, iters_strict = self._iterate(
             q.copy(), target_pose, position_only=False,
         )
-        strict_converged = (pos_err_strict < _POS_TOL
-                            and rot_err_strict < _ROT_TOL)
+        strict_pos_ok = pos_err_strict < _USABLE_POS_TOL
+        strict_full_success = (strict_pos_ok
+                               and rot_err_strict < _USABLE_ROT_TOL_STRICT)
 
-        if strict_converged:
+        if strict_full_success:
+            # Best case: 6-DOF target genuinely reachable.
             return self._finalize_result(
                 q_strict, pos_err_strict, rot_err_strict, iters_strict,
-                converged=True, position_priority_used=False,
+                converged=(pos_err_strict < _POS_TOL
+                           and rot_err_strict < _ROT_TOL),
+                position_priority_used=False,
                 target_pose=target_pose,
             )
 
-        # Pass 2: position-priority fallback, seeded from the original
-        # user seed (NOT from q_strict — empirically the strict pass
-        # can wander into poor local minima when the target is over-
-        # extended, and seeding the relaxed pass from there inherits
-        # the bad starting point).
+        # Pass 2: position-priority. Always run when strict didn't
+        # achieve a full 6-DOF success — even if strict's position
+        # was tight but rotation was off, the relaxed pass may find
+        # a different joint config with better OR comparable position
+        # and acceptable rotation drift, which is the user-preferred
+        # outcome.
         q_seed_arr = np.zeros(self.model.nq)
         for i, v in enumerate(q_seed_deg_7):
             q_seed_arr[self._q_indices[i]] = np.radians(v)
@@ -169,26 +174,23 @@ class CartesianIKSolver:
             q_seed_arr, target_pose, position_only=True,
         )
 
-        # The strict pass didn't converge. Prefer the relaxed result
-        # whenever it's at least as good on position (with a small
-        # tolerance for floating-point ties), because the relaxed pass
-        # is the one designed to handle "rotation can't be fully
-        # honoured" situations — it's the right answer for the user's
-        # primary use case ("push X, let other axes drift"). Only fall
-        # back to the strict pass if the relaxed pass actually did
-        # significantly worse on position, which would mean the
-        # relaxed solver wandered.
-        relaxed_better = pos_err_relaxed <= pos_err_strict + 1e-4
-        if relaxed_better:
+        # Pick the pass with the lower position error. Strict is only
+        # preferred when its position is meaningfully better than the
+        # relaxed pass's; otherwise we use relaxed even with rotation
+        # drift, since position is the primary criterion the user
+        # gives us.
+        strict_meaningfully_better = pos_err_strict + 1e-4 < pos_err_relaxed
+
+        if strict_meaningfully_better:
             return self._finalize_result(
-                q_relaxed, pos_err_relaxed, rot_err_relaxed,
-                iters_strict + iters_relaxed,
-                converged=False, position_priority_used=True,
+                q_strict, pos_err_strict, rot_err_strict, iters_strict,
+                converged=False, position_priority_used=False,
                 target_pose=target_pose,
             )
         return self._finalize_result(
-            q_strict, pos_err_strict, rot_err_strict, iters_strict,
-            converged=False, position_priority_used=False,
+            q_relaxed, pos_err_relaxed, rot_err_relaxed,
+            iters_strict + iters_relaxed,
+            converged=False, position_priority_used=True,
             target_pose=target_pose,
         )
 
@@ -332,8 +334,16 @@ class CartesianIKSolver:
             # thresholds.
             converged = (pos_err_m < _POS_TOL and rot_err_rad < _ROT_TOL)
 
-        usable = (pos_err_m < _USABLE_POS_TOL
-                  and rot_err_rad < _USABLE_ROT_TOL)
+        # Usability rule:
+        #   - Position is the primary criterion (must be within tolerance).
+        #   - If we used position-priority, the relaxed rot tolerance
+        #     applies — rotation residual is mostly informational
+        #     because that pass deliberately ignored it.
+        #   - If strict was used, the tighter rot tolerance applies
+        #     because strict was supposed to satisfy rotation too.
+        rot_tol = (_USABLE_ROT_TOL_RELAXED if position_priority_used
+                   else _USABLE_ROT_TOL_STRICT)
+        usable = (pos_err_m < _USABLE_POS_TOL and rot_err_rad < rot_tol)
 
         return IKResult(
             q_deg=q_deg,
