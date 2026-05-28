@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # truly user-preferences vs transient state.
 PERSISTED_FIELDS: tuple[str, ...] = (
     "max_speed_deg_per_sec",
+    "max_speed_deg_per_sec_gripper",
     "gravity_comp_scale",
     "vr_pos_scale",
     "vr_rot_scale",
@@ -116,6 +117,7 @@ def reset_to_defaults(state: RuntimeState) -> dict[str, object]:
     """
     defaults = {
         "max_speed_deg_per_sec": config.INITIAL_MAX_SPEED_DEG_PER_SEC,
+        "max_speed_deg_per_sec_gripper": config.INITIAL_MAX_SPEED_DEG_PER_SEC_GRIPPER,
         "gravity_comp_scale": config.INITIAL_GRAVITY_COMP_SCALE,
         "vr_pos_scale": config.INITIAL_VR_POS_SCALE,
         "vr_rot_scale": config.INITIAL_VR_ROT_SCALE,

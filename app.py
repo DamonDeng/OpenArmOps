@@ -58,7 +58,7 @@ class MainWindow(QMainWindow):
         self.controller_tab = ControllerTab(robot, state, worker)
         self.cartesian_tab = CartesianTab(robot, worker)
         self.vr_info_tab = VRTab(vr_receiver)
-        self.vr_control_tab = VRControlTab(worker, vr_receiver)
+        self.vr_control_tab = VRControlTab(worker, vr_receiver, state)
         # System tab gets a reference to the controller tab so its
         # "Reload key bindings" button can reach into ControllerTab's
         # bindings dict.

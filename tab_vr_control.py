@@ -34,10 +34,24 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from lerobot.robots.openarm_follower.config_openarm_follower import (
+    LEFT_DEFAULT_JOINTS_LIMITS,
+    RIGHT_DEFAULT_JOINTS_LIMITS,
+)
+
+from . import config
 from .motion_worker import MotionWorker
+from .runtime_state import RuntimeState
 from .vr_input import VRInputReceiver
 
 logger = logging.getLogger(__name__)
+
+
+# Tall enough to be a comfortable target through a Pico headset where the
+# operator can't precisely position the cursor, but short enough that two
+# stacked panels still fit on the screen.
+_VR_BUTTON_MIN_HEIGHT_PX = 90
+_VR_GO_HOME_MIN_HEIGHT_PX = 64
 
 
 class _ArmVRPanel(QGroupBox):
@@ -53,12 +67,26 @@ class _ArmVRPanel(QGroupBox):
 
         self.btn_enable = QPushButton("VR: OFF")
         self.btn_enable.setCheckable(True)
+        self.btn_enable.setMinimumHeight(_VR_BUTTON_MIN_HEIGHT_PX)
+        # Tall, big-text button so the operator can hit it through a VR
+        # headset without precise cursor placement.
         self.btn_enable.setStyleSheet(
-            "QPushButton { padding: 8px; font-weight: bold; }"
+            "QPushButton { padding: 12px; font-weight: bold; font-size: 22pt; }"
             "QPushButton:checked { background-color: #27a; color: white; }"
         )
         self.btn_enable.clicked.connect(self._on_toggle)
         v.addWidget(self.btn_enable)
+
+        # "Slow go to zero" — works whether VR is engaged or not. We
+        # disengage VR for this arm first, then post slow joint targets
+        # at SLOW_SPEED_DEG_PER_SEC. Sized for headset clicking.
+        self.btn_go_zero = QPushButton("Slow go to zero")
+        self.btn_go_zero.setMinimumHeight(_VR_GO_HOME_MIN_HEIGHT_PX)
+        self.btn_go_zero.setStyleSheet(
+            "QPushButton { padding: 10px; font-size: 16pt; }"
+        )
+        self.btn_go_zero.clicked.connect(self._on_slow_go_to_zero)
+        v.addWidget(self.btn_go_zero)
 
         self.status_mode = QLabel("Mode: —")
         self.status_clutch = QLabel("Clutch: —")
@@ -81,6 +109,35 @@ class _ArmVRPanel(QGroupBox):
 
     def _set_button_text(self, enabled: bool) -> None:
         self.btn_enable.setText(f"VR: {'ON' if enabled else 'OFF'}")
+
+    def _on_slow_go_to_zero(self) -> None:
+        """Disengage VR for this arm, then walk every joint to 0° at
+        the slow speed. Mirrors tab_controller.ControllerTab._on_slow_go_to_zero
+        but operates without slider state — the joint list comes from the
+        LeRobot per-arm default joint-limits dict.
+        """
+        # Step 1: turn off VR for this arm so the cartesian-tick stops
+        # overwriting joint targets. The worker processes commands
+        # in order, so the disable lands before the joint targets.
+        self.worker.post_vr_enable(self.arm, False)
+        self._set_button_text(False)
+
+        # Step 2: post slow targets to 0° for every joint + gripper.
+        # Use the LeRobot package's default-limits dict as the source
+        # of truth for the joint name list.
+        limits = (LEFT_DEFAULT_JOINTS_LIMITS if self.arm == "left"
+                  else RIGHT_DEFAULT_JOINTS_LIMITS)
+        for joint, (lo, hi) in limits.items():
+            target = max(lo, min(hi, 0.0))
+            self.worker.post_set_target(
+                self.arm, joint, target,
+                deg_per_sec=config.SLOW_SPEED_DEG_PER_SEC,
+            )
+        logger.info(
+            f"VR Control: slow go-to-zero on {self.arm} arm "
+            f"at {config.SLOW_SPEED_DEG_PER_SEC} °/s "
+            f"(VR auto-disengaged)"
+        )
 
     def refresh(self) -> None:
         # Keep the button synchronised with the worker's actual flag.
@@ -138,11 +195,13 @@ class VRControlTab(QWidget):
         self,
         worker: MotionWorker,
         receiver: VRInputReceiver,
+        state: RuntimeState,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.worker = worker
         self.receiver = receiver
+        self.state = state
 
         root = QVBoxLayout(self)
 
@@ -163,6 +222,29 @@ class VRControlTab(QWidget):
         cols.addWidget(self.left_panel)
         cols.addWidget(self.right_panel)
         root.addLayout(cols, stretch=1)
+
+        # ── Live VR position-scale adjuster ────────────────────────
+        # Big buttons so the operator can hit them with the headset on.
+        # Mirrors the System-tab spinbox: both write the same
+        # runtime.vr_pos_scale, so the spinbox updates automatically
+        # the next time the System tab refreshes.
+        scale_row = QHBoxLayout()
+        self.btn_scale_down = QPushButton("− Scale")
+        self.btn_scale_up = QPushButton("Scale +")
+        self.lbl_scale = QLabel(self._fmt_scale())
+        self.lbl_scale.setAlignment(Qt.AlignCenter)
+        self.lbl_scale.setStyleSheet("font-size: 18pt; font-weight: bold;")
+        for btn in (self.btn_scale_down, self.btn_scale_up):
+            btn.setMinimumHeight(_VR_GO_HOME_MIN_HEIGHT_PX)
+            btn.setStyleSheet(
+                "QPushButton { padding: 10px; font-size: 18pt; }"
+            )
+        self.btn_scale_down.clicked.connect(lambda: self._nudge_scale(-1))
+        self.btn_scale_up.clicked.connect(lambda: self._nudge_scale(+1))
+        scale_row.addWidget(self.btn_scale_down)
+        scale_row.addWidget(self.lbl_scale, stretch=1)
+        scale_row.addWidget(self.btn_scale_up)
+        root.addLayout(scale_row)
 
         btn_row = QHBoxLayout()
         self.btn_disengage_all = QPushButton("Disengage both arms")
@@ -186,6 +268,23 @@ class VRControlTab(QWidget):
         self.worker.post_vr_enable("right", False)
         logger.info("VR Control: disengage-all clicked")
 
+    def _fmt_scale(self) -> str:
+        return f"VR pos scale: {self.state.vr_pos_scale:.2f}×"
+
+    def _nudge_scale(self, direction: int) -> None:
+        step = config.VR_SCALE_STEP * direction
+        new_scale = self.state.vr_pos_scale + step
+        new_scale = max(config.VR_SCALE_MIN, min(config.VR_SCALE_MAX, new_scale))
+        # Round to the spinbox's step granularity so repeated nudges
+        # don't drift away from on-grid values.
+        new_scale = round(new_scale / config.VR_SCALE_STEP) * config.VR_SCALE_STEP
+        self.state.vr_pos_scale = float(new_scale)
+        self.lbl_scale.setText(self._fmt_scale())
+        logger.info(f"VR Control: vr_pos_scale → {new_scale:.3f}")
+
     def _refresh(self) -> None:
         self.left_panel.refresh()
         self.right_panel.refresh()
+        # Pick up scale changes from the System-tab spinbox so the
+        # readout stays in sync regardless of which tab last touched it.
+        self.lbl_scale.setText(self._fmt_scale())

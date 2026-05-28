@@ -892,11 +892,16 @@ class MotionWorker(QThread):
             self._set_joint_target(key, float(cur), float(result.q_deg[i]), speed)
 
         # Gripper is not part of IK; if target specifies one, send it too.
+        # Gripper has its own speed cap (independent of arm-joint speed)
+        # so it can snap on trigger rather than ramping like a joint.
         if target.gripper is not None:
             key = f"{arm}_gripper.pos"
             cur = current.get(key)
             if cur is not None:
-                self._set_joint_target(key, float(cur), float(target.gripper), speed)
+                self._set_joint_target(
+                    key, float(cur), float(target.gripper),
+                    self.runtime.max_speed_deg_per_sec_gripper,
+                )
 
     # ------------------------------------------------------------------
     # Helpers

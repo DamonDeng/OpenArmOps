@@ -53,6 +53,14 @@ MOTION_HZ = 30
 # up (the lead cap below handles lag). Runtime-editable from System tab.
 INITIAL_MAX_SPEED_DEG_PER_SEC = 20.0
 
+# Standalone speed cap for the gripper motor only. Independent from the
+# arm-joint cap above so the operator can have slow, deliberate arm
+# motion while the gripper still snaps closed/open the moment the
+# controller trigger is squeezed/released. Tuned to feel "gripper-like"
+# rather than "another joint" — the gripper's mechanical range is small
+# (~65°) so even 360°/s is bounded by the trigger going 0→1 in one tick.
+INITIAL_MAX_SPEED_DEG_PER_SEC_GRIPPER = 360.0
+
 # Fixed slow speed used by the "Slow go to zero" buttons. Intentionally
 # independent of the System-tab setting — the whole point of those buttons
 # is to get a predictable, gentle motion regardless of current config.

@@ -15,6 +15,11 @@ from . import config
 @dataclass
 class RuntimeState:
     max_speed_deg_per_sec: float = config.INITIAL_MAX_SPEED_DEG_PER_SEC
+    # Standalone gripper speed cap. The gripper's job is to snap
+    # closed/open as the operator squeezes/releases the trigger, not
+    # to ramp like an arm joint, so it has its own setting that
+    # bypasses the arm-joint speed.
+    max_speed_deg_per_sec_gripper: float = config.INITIAL_MAX_SPEED_DEG_PER_SEC_GRIPPER
     gravity_comp_scale: float = config.INITIAL_GRAVITY_COMP_SCALE
     # VR control-display gain. Multiplies the cumulative-since-snapshot
     # SE3 delta after frame remap so the user can tune how much arm

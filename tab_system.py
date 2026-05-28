@@ -179,6 +179,17 @@ class SystemTab(QWidget):
         self.speed_spin.valueChanged.connect(self._on_speed_changed)
         speed_form.addRow("Max commanded speed:", self.speed_spin)
 
+        # Standalone gripper speed cap. Wider range than arm joints so
+        # the gripper can snap on trigger rather than ramp like a joint.
+        self.gripper_speed_spin = QDoubleSpinBox()
+        self.gripper_speed_spin.setDecimals(0)
+        self.gripper_speed_spin.setRange(1.0, 1000.0)
+        self.gripper_speed_spin.setSingleStep(20.0)
+        self.gripper_speed_spin.setSuffix(" °/s")
+        self.gripper_speed_spin.setValue(self.state.max_speed_deg_per_sec_gripper)
+        self.gripper_speed_spin.valueChanged.connect(self._on_gripper_speed_changed)
+        speed_form.addRow("Gripper speed:", self.gripper_speed_spin)
+
         self.gcomp_spin = QDoubleSpinBox()
         self.gcomp_spin.setDecimals(2)
         self.gcomp_spin.setRange(uiconfig.GRAVITY_COMP_SCALE_MIN,
@@ -359,6 +370,10 @@ class SystemTab(QWidget):
         self.state.max_speed_deg_per_sec = float(value)
         logger.info(f"max commanded speed set to {value:.1f} °/s")
 
+    def _on_gripper_speed_changed(self, value: float) -> None:
+        self.state.max_speed_deg_per_sec_gripper = float(value)
+        logger.info(f"gripper speed set to {value:.1f} °/s")
+
     def _on_gravity_comp_changed(self, value: float) -> None:
         self.state.gravity_comp_scale = float(value)
         logger.info(f"gravity comp scale set to {value:.2f}")
@@ -378,6 +393,7 @@ class SystemTab(QWidget):
         """
         for spin, value in (
             (self.speed_spin, self.state.max_speed_deg_per_sec),
+            (self.gripper_speed_spin, self.state.max_speed_deg_per_sec_gripper),
             (self.gcomp_spin, self.state.gravity_comp_scale),
             (self.vr_pos_spin, self.state.vr_pos_scale),
             (self.vr_rot_spin, self.state.vr_rot_scale),
