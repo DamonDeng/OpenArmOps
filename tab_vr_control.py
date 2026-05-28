@@ -77,6 +77,21 @@ class _ArmVRPanel(QGroupBox):
         self.btn_enable.clicked.connect(self._on_toggle)
         v.addWidget(self.btn_enable)
 
+        # Absolute-mode toggle — alternative tracker that locks a single
+        # reference pose pair on the first grip press of a VR-enable
+        # cycle and keeps it across subsequent grip releases. Useful
+        # when comparing smoothness against the relative (clutch +
+        # filter + dead-band) path.
+        self.btn_absolute = QPushButton("Mode: relative (clutch)")
+        self.btn_absolute.setCheckable(True)
+        self.btn_absolute.setMinimumHeight(_VR_GO_HOME_MIN_HEIGHT_PX)
+        self.btn_absolute.setStyleSheet(
+            "QPushButton { padding: 8px; font-size: 14pt; }"
+            "QPushButton:checked { background-color: #b73; color: white; }"
+        )
+        self.btn_absolute.clicked.connect(self._on_absolute_toggle)
+        v.addWidget(self.btn_absolute)
+
         # "Slow go to zero" — works whether VR is engaged or not. We
         # disengage VR for this arm first, then post slow joint targets
         # at SLOW_SPEED_DEG_PER_SEC. Sized for headset clicking.
@@ -109,6 +124,15 @@ class _ArmVRPanel(QGroupBox):
 
     def _set_button_text(self, enabled: bool) -> None:
         self.btn_enable.setText(f"VR: {'ON' if enabled else 'OFF'}")
+
+    def _on_absolute_toggle(self, checked: bool) -> None:
+        self.worker.post_vr_absolute(self.arm, checked)
+        self._set_absolute_text(checked)
+
+    def _set_absolute_text(self, absolute: bool) -> None:
+        self.btn_absolute.setText(
+            "Mode: ABSOLUTE (locked ref)" if absolute else "Mode: relative (clutch)"
+        )
 
     def _on_slow_go_to_zero(self) -> None:
         """Disengage VR for this arm, then walk every joint to 0° at
@@ -149,6 +173,13 @@ class _ArmVRPanel(QGroupBox):
             self.btn_enable.setChecked(enabled)
             self.btn_enable.blockSignals(False)
         self._set_button_text(enabled)
+
+        absolute = self.worker.vr_absolute(self.arm)
+        if self.btn_absolute.isChecked() != absolute:
+            self.btn_absolute.blockSignals(True)
+            self.btn_absolute.setChecked(absolute)
+            self.btn_absolute.blockSignals(False)
+        self._set_absolute_text(absolute)
 
         self.status_mode.setText(f"Mode: {self.worker.current_mode(self.arm)}")
 

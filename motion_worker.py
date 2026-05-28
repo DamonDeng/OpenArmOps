@@ -44,6 +44,7 @@ from .ik_solver import (
 )
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
+from .vr_absolute_tracker import VRAbsoluteTracker
 from .vr_input import VRInputReceiver
 
 try:
@@ -206,6 +207,8 @@ class _Command:
     # "stop"               — thread exit
     # "set_mode"           — switch an arm between joint/cartesian mode
     # "set_cart_target"    — set the cartesian target pose for an arm
+    # "vr_enable"          — toggle VR control hard-enable for an arm
+    # "vr_absolute"        — toggle absolute-pose tracker for an arm
     kind: str
     arm: Optional[str] = None
     joint: Optional[str] = None
@@ -303,6 +306,14 @@ class MotionWorker(QThread):
         # IN threshold. Resets on snapshot.
         self._vr_moving: dict[str, bool] = {"left": False, "right": False}
 
+        # Absolute-pose tracker — the alternative to the relative
+        # snapshot/delta path above. Selection is per-arm via
+        # self._vr_absolute[arm] (toggled from the UI). The tracker
+        # holds session-fixed references; it's reset whenever an arm's
+        # VR control is turned OFF or on e-stop.
+        self._vr_absolute: dict[str, bool] = {"left": False, "right": False}
+        self._vr_abs_tracker = VRAbsoluteTracker()
+
         # Per-arm worker pool. Left and right arms ride independent CAN
         # buses (can0 / can1), so we dispatch their MIT sends and state
         # reads in parallel rather than serially. With one tick of
@@ -367,6 +378,20 @@ class MotionWorker(QThread):
     def vr_enabled(self, arm: str) -> bool:
         """Read-only VR-enable state for the UI."""
         return self._vr_enabled.get(arm, False)
+
+    def post_vr_absolute(self, arm: str, enabled: bool) -> None:
+        """Toggle absolute-pose VR mode for one arm. In absolute mode the
+        reference pose pair is locked on the first grip press of the
+        VR-enable cycle and reused across subsequent grip presses;
+        releases freeze the arm without clearing the reference. The
+        flag may be flipped while VR control is on or off — but if
+        it's flipped while on, any existing reference is cleared so
+        the next grip press starts fresh.
+        """
+        self.command_queue.put(_Command(kind="vr_absolute", arm=arm, torque_enabled=enabled))
+
+    def vr_absolute(self, arm: str) -> bool:
+        return self._vr_absolute.get(arm, False)
 
     def compute_fk(self, arm: str) -> Optional[pin.SE3]:
         """Return the arm's current TCP pose (from the last observed joint
@@ -482,7 +507,10 @@ class MotionWorker(QThread):
         for arm in ("left", "right"):
             if not self._vr_enabled[arm]:
                 continue
-            self._vr_tick(arm)
+            if self._vr_absolute[arm]:
+                self._vr_tick_absolute(arm)
+            else:
+                self._vr_tick(arm)
 
         # 3b. For arms in cartesian mode, solve IK once and write the
         # resulting joint angles as new targets. The rest of the tick
@@ -798,10 +826,74 @@ class MotionWorker(QThread):
         target = snap.arm * delta
         self._apply_vr_cart_target(arm, target, gripper_target)
 
+    def _vr_tick_absolute(self, arm: str) -> None:
+        """Per-tick update of _cart_target for an arm in VR absolute-pose mode.
+
+        Bypasses the EMA filter and hysteretic dead-band entirely — the raw
+        controller pose drives the math each tick. Reference is taken once
+        per VR-enable cycle on the first grip press; subsequent grip releases
+        freeze the arm but preserve the reference, so re-pressing grip
+        resumes from the same origin.
+        """
+        if self.vr_receiver is None:
+            return
+        state = self.vr_receiver.left() if arm == "left" else self.vr_receiver.right()
+        if not state.has_ever_been_seen:
+            return
+
+        grip_engaged = state.grip >= config.VR_GRIP_ENABLE_THRESHOLD
+
+        ctrl_pose = self._controller_pose(state)
+
+        if grip_engaged:
+            trig = max(0.0, min(1.0, state.trigger))
+            gripper_target = (
+                _GRIPPER_DEG_OPEN + (_GRIPPER_DEG_CLOSED - _GRIPPER_DEG_OPEN) * trig
+            )
+        else:
+            gripper_target = self._last_current.get(f"{arm}_gripper.pos", 0.0)
+
+        arm_fk = self.compute_fk(arm)
+        if arm_fk is None:
+            return
+
+        M_t, M_r = self._get_remap(arm)
+        target = self._vr_abs_tracker.tick(
+            arm,
+            ctrl_pose=ctrl_pose,
+            arm_fk=arm_fk,
+            grip_engaged=grip_engaged,
+            s_pos=float(self.runtime.vr_pos_scale),
+            s_rot=float(self.runtime.vr_rot_scale),
+            translation_remap=M_t,
+            rotation_remap=M_r,
+        )
+        if target is None:
+            # Either pre-first-press or grip released — leave cart_target
+            # at its last value so the arm freezes.
+            return
+
+        self._apply_vr_cart_target(arm, target, gripper_target)
+
     # Cached numpy versions of the remap matrices, one pair per arm.
     # Built on first use and reused; reset to None to pick up config edits
     # (rare — would require a process restart with current code).
     _vr_remap_cache: "dict[str, tuple[np.ndarray, np.ndarray]]" = {}
+
+    def _get_remap(self, arm: str) -> "tuple[np.ndarray, np.ndarray]":
+        cache = MotionWorker._vr_remap_cache
+        if arm not in cache:
+            if arm == "left":
+                t_src = config.VR_TRANSLATION_REMAP_LEFT
+                r_src = config.VR_ROTATION_REMAP_LEFT
+            else:
+                t_src = config.VR_TRANSLATION_REMAP_RIGHT
+                r_src = config.VR_ROTATION_REMAP_RIGHT
+            cache[arm] = (
+                np.array(t_src, dtype=float),
+                np.array(r_src, dtype=float),
+            )
+        return cache[arm]
 
     def _apply_vr_remap(self, arm: str, delta: "pin.SE3") -> "pin.SE3":
         """Apply the per-arm VR-to-robot axis remap to an SE3 delta.
@@ -816,19 +908,7 @@ class MotionWorker(QThread):
         trajectory. The component-wise math here is the
         mathematically correct change of basis.
         """
-        cache = MotionWorker._vr_remap_cache
-        if arm not in cache:
-            if arm == "left":
-                t_src = config.VR_TRANSLATION_REMAP_LEFT
-                r_src = config.VR_ROTATION_REMAP_LEFT
-            else:
-                t_src = config.VR_TRANSLATION_REMAP_RIGHT
-                r_src = config.VR_ROTATION_REMAP_RIGHT
-            cache[arm] = (
-                np.array(t_src, dtype=float),
-                np.array(r_src, dtype=float),
-            )
-        M_t, M_r = cache[arm]
+        M_t, M_r = self._get_remap(arm)
         t_new = M_t @ delta.translation
         R_new = M_r @ delta.rotation @ M_r.T
         return pin.SE3(R_new, t_new)
@@ -1087,7 +1167,25 @@ class MotionWorker(QThread):
                     self._vr_snapshot[arm] = None
                     self._vr_filt_pose[arm] = None
                     self._vr_moving[arm] = False
+                    # Absolute-mode reference is session-fixed across grip
+                    # cycles, so it MUST be cleared when the operator
+                    # turns VR control off — otherwise the next session
+                    # would resume from a stale origin.
+                    self._vr_abs_tracker.reset(arm)
                     logger.info(f"{arm}: VR control DISABLED; arm back to joint mode")
+            elif cmd.kind == "vr_absolute":
+                arm = cmd.arm or ""
+                enabled = bool(cmd.torque_enabled)
+                if arm not in self._vr_absolute:
+                    continue
+                self._vr_absolute[arm] = enabled
+                # Always reset the reference on a flag flip so the next
+                # grip press takes a fresh origin. Avoids carrying a
+                # stale reference across mode flips.
+                self._vr_abs_tracker.reset(arm)
+                logger.info(
+                    f"{arm}: VR absolute mode {'ENABLED' if enabled else 'DISABLED'}"
+                )
             elif cmd.kind == "estop":
                 for arm in ("left", "right"):
                     self.robot.set_torque(arm, False)
@@ -1117,6 +1215,7 @@ class MotionWorker(QThread):
                     self._vr_snapshot[arm] = None
                     self._vr_filt_pose[arm] = None
                     self._vr_moving[arm] = False
+                self._vr_abs_tracker.reset_all()
                 logger.warning(
                     "motion worker: e-stop consumed; torque off; trajectories pinned; "
                     "gravity_comp_scale reset to 0; arms returned to joint mode; "
