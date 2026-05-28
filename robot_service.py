@@ -31,13 +31,26 @@ class RobotService:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        # Lifecycle mutex: serialises connect()/disconnect() against each
+        # other. Most other methods don't acquire this; per-arm locks
+        # prevent in-flight sends from racing teardown.
+        self._lifecycle_lock = threading.Lock()
+        # Per-arm locks. Each guards access to that arm's CAN bus. The two
+        # arms ride on physically independent buses (can0 / can1) so per-arm
+        # operations can run concurrently — we exploit that to dispatch the
+        # left and right MIT batches in parallel from the motion worker.
+        # Fixed lock order whenever both are needed: left, then right.
+        self._left_lock = threading.Lock()
+        self._right_lock = threading.Lock()
         self._robot: BiOpenArmFollowerNoAutoZero | None = None
         self._connected = False
         # Tracks whether cameras are known-dead. We log the transition ONCE
         # (not per tick) and then fall back to a state-only observation until
         # the app is restarted. No auto-reconnect by design.
         self._cameras_dead = False
+
+    def _arm_lock(self, arm: str) -> threading.Lock:
+        return self._left_lock if arm == "left" else self._right_lock
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -46,7 +59,7 @@ class RobotService:
         """Construct and connect the robot. Torque is disabled immediately
         after connect — users explicitly turn it on per arm from the UI.
         """
-        with self._lock:
+        with self._lifecycle_lock, self._left_lock, self._right_lock:
             if self._connected:
                 return
 
@@ -98,7 +111,7 @@ class RobotService:
             logger.info(f"Robot connected; torque disabled on both arms; {cal_state}.")
 
     def disconnect(self) -> None:
-        with self._lock:
+        with self._lifecycle_lock, self._left_lock, self._right_lock:
             if not self._connected or self._robot is None:
                 return
             try:
@@ -117,7 +130,7 @@ class RobotService:
     @property
     def is_calibrated(self) -> bool:
         """True iff BOTH arms have a matching calibration loaded on their motors."""
-        with self._lock:
+        with self._left_lock, self._right_lock:
             if not self._connected or self._robot is None:
                 return False
             return self._robot.is_calibrated
@@ -130,7 +143,7 @@ class RobotService:
         Caller MUST disable torque on the other arm too and confirm the arm
         is in the 'hanging straight down, gripper closed' pose before calling.
         """
-        with self._lock:
+        with self._arm_lock(arm):
             if not self._connected or self._robot is None:
                 raise RuntimeError("not connected")
             target = self._robot.left_arm if arm == "left" else self._robot.right_arm
@@ -158,7 +171,7 @@ class RobotService:
         Use when you've moved the arm manually and want the current pose to
         read as 0°. Does not change joint-limit ranges or drive modes.
         """
-        with self._lock:
+        with self._arm_lock(arm):
             if not self._connected or self._robot is None:
                 raise RuntimeError("not connected")
             target = self._robot.left_arm if arm == "left" else self._robot.right_arm
@@ -171,7 +184,7 @@ class RobotService:
     # ------------------------------------------------------------------
     def set_torque(self, arm: str, enabled: bool) -> None:
         """arm in {'left', 'right'}."""
-        with self._lock:
+        with self._arm_lock(arm):
             if not self._connected or self._robot is None:
                 return
             target = self._robot.left_arm if arm == "left" else self._robot.right_arm
@@ -182,7 +195,7 @@ class RobotService:
             logger.info(f"torque {arm}: {'on' if enabled else 'off'}")
 
     def emergency_stop(self) -> None:
-        with self._lock:
+        with self._left_lock, self._right_lock:
             if not self._connected or self._robot is None:
                 return
             self._robot.left_arm.bus.disable_torque()
@@ -192,6 +205,29 @@ class RobotService:
     # ------------------------------------------------------------------
     # IO
     # ------------------------------------------------------------------
+    def read_arm_state(self, arm: str) -> dict | None:
+        """Read motor state for a single arm. Used by the motion worker to
+        parallelise the two arms' CAN reads — left and right ride on
+        independent buses (can0 / can1) so this only acquires that arm's
+        lock. Returns the same key shape BiOpenArmFollower would emit
+        (``"{arm}_{motor}.pos"`` etc.), state-only.
+        """
+        with self._arm_lock(arm):
+            if not self._connected or self._robot is None:
+                return None
+            target = self._robot.left_arm if arm == "left" else self._robot.right_arm
+            try:
+                states = target.bus.sync_read_all_states()
+            except Exception as e:
+                logger.exception(f"read_arm_state({arm}) failed: {e}")
+                return None
+            obs: dict = {}
+            for motor, state in states.items():
+                obs[f"{arm}_{motor}.pos"] = state.get("position", 0.0)
+                obs[f"{arm}_{motor}.vel"] = state.get("velocity", 0.0)
+                obs[f"{arm}_{motor}.torque"] = state.get("torque", 0.0)
+            return obs
+
     def get_observation(self) -> dict | None:
         """Return the robot observation, tolerating camera failures.
 
@@ -202,8 +238,12 @@ class RobotService:
         thread is not running``), we switch to a state-only fallback that
         only reads motor positions. Cameras stay dead until app restart;
         we log the transition once to avoid flooding the console.
+
+        Holds BOTH per-arm locks because BiOpenArmFollower.get_observation
+        reads both buses internally; per-arm read_arm_state() exists for
+        callers that want to parallelise the two arms.
         """
-        with self._lock:
+        with self._left_lock, self._right_lock:
             if not self._connected or self._robot is None:
                 return None
 
@@ -253,7 +293,7 @@ class RobotService:
         and other consumers (e.g. the Controller tab's joint sliders)
         stay untouched.
         """
-        with self._lock:
+        with self._arm_lock(arm):
             if not self._connected or self._robot is None:
                 return None
             src = self._robot.left_arm.config if arm == "left" else self._robot.right_arm.config
@@ -290,7 +330,7 @@ class RobotService:
         That keeps this cheap (no extra bus load) and avoids stepping on
         the motion worker's reads.
         """
-        with self._lock:
+        with self._left_lock, self._right_lock:
             if not self._connected or self._robot is None:
                 return None
             result: dict[str, dict[str, float]] = {}
@@ -304,7 +344,9 @@ class RobotService:
             return result
 
     def send_action(self, action: dict) -> None:
-        with self._lock:
+        # send_action drives both arms internally. Hold both locks to
+        # serialise it against per-arm reads/writes.
+        with self._left_lock, self._right_lock:
             if not self._connected or self._robot is None:
                 return
             self._robot.send_action(action)
@@ -321,8 +363,12 @@ class RobotService:
         motor is ``(kp, kd, position_deg, velocity_deg_per_sec, torque_ff_Nm)``.
         Joint-limit clipping and kp/kd selection are the caller's
         responsibility — this wrapper just forwards to the bus.
+
+        Acquires only this arm's lock — left and right ride independent
+        CAN buses, so the motion worker can dispatch both batches in
+        parallel without contention.
         """
-        with self._lock:
+        with self._arm_lock(arm):
             if not self._connected or self._robot is None:
                 return
             target_arm = self._robot.left_arm if arm == "left" else self._robot.right_arm

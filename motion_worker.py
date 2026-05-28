@@ -28,6 +28,7 @@ import logging
 import math
 import queue
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -302,6 +303,16 @@ class MotionWorker(QThread):
         # IN threshold. Resets on snapshot.
         self._vr_moving: dict[str, bool] = {"left": False, "right": False}
 
+        # Per-arm worker pool. Left and right arms ride independent CAN
+        # buses (can0 / can1), so we dispatch their MIT sends and state
+        # reads in parallel rather than serially. With one tick of
+        # serialised work taking ~2× a single arm's CAN time, two-arm
+        # operation visibly trembled because each arm only got commanded
+        # at ~half the effective rate. 2 threads, named for log clarity.
+        self._can_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="can-arm"
+        )
+
     # ------------------------------------------------------------------
     # UI-facing API — these only post to the queue, they don't touch state.
     # ------------------------------------------------------------------
@@ -438,6 +449,10 @@ class MotionWorker(QThread):
                 # into an unbounded catch-up loop if one tick was very slow.
                 next_tick = now
 
+        # Drain in-flight CAN tasks before returning so a pending send
+        # can't outlive the worker thread and try to use a torn-down
+        # robot service.
+        self._can_pool.shutdown(wait=True)
         logger.info("MotionWorker exiting")
 
     def _tick_once(self) -> None:
@@ -525,10 +540,16 @@ class MotionWorker(QThread):
         current: dict[str, float],
     ) -> None:
         """Split the per-joint action dict by arm, compute gravity comp
-        torques per arm, and send one MIT batch per arm through the
-        robot service.
+        torques per arm, and send one MIT batch per arm.
+
+        Builds both arms' payloads serially (cheap math), then dispatches
+        the two CAN sends in parallel via ``self._can_pool``. The send
+        methods take per-arm locks in RobotService, so the two arms'
+        traffic doesn't serialise behind a single mutex.
         """
         scale = float(self.runtime.gravity_comp_scale)
+
+        per_arm_commands: dict[str, dict[str, tuple[float, float, float, float, float]]] = {}
 
         for arm, gc in (("left", self._gc_left), ("right", self._gc_right)):
             # Collect this arm's actions (joint_name -> pos_deg).
@@ -575,11 +596,22 @@ class MotionWorker(QThread):
                     0.0,              # velocity feedforward unused
                     tau_ff[i],
                 )
+            if commands:
+                per_arm_commands[arm] = commands
 
-            if not commands:
-                continue
+        if not per_arm_commands:
+            return
+
+        # Dispatch all arms' sends in parallel and join. Each future
+        # holds only its arm's lock in RobotService so they really do
+        # overlap on the wire.
+        futures = {
+            arm: self._can_pool.submit(self.robot.send_mit_batch, arm, cmds)
+            for arm, cmds in per_arm_commands.items()
+        }
+        for arm, fut in futures.items():
             try:
-                self.robot.send_mit_batch(arm, commands)
+                fut.result()
             except Exception as e:
                 logger.error(f"send_mit_batch failed for {arm} arm: {e}")
                 self.send_error.emit(str(e))
@@ -1092,9 +1124,23 @@ class MotionWorker(QThread):
                 )
 
     def _read_state(self) -> Optional[dict[str, float]]:
-        """Read motor positions only. Cameras are read by the UI thread."""
-        obs = self.robot.get_observation()
-        if obs is None:
+        """Read motor positions for both arms in parallel.
+
+        Each arm has its own CAN bus and its own lock in RobotService, so
+        the two reads can overlap. We submit one task per arm to the can
+        pool and join both before returning. If either side fails we
+        return None — the worker treats that as a transient skip-this-
+        tick.
+        """
+        fut_left = self._can_pool.submit(self.robot.read_arm_state, "left")
+        fut_right = self._can_pool.submit(self.robot.read_arm_state, "right")
+        left = fut_left.result()
+        right = fut_right.result()
+        if left is None or right is None:
             return None
-        # Keep only .pos scalars. Cameras and .vel/.torque are noise here.
-        return {k: float(v) for k, v in obs.items() if k.endswith(".pos")}
+        merged: dict[str, float] = {}
+        for obs in (left, right):
+            for k, v in obs.items():
+                if k.endswith(".pos"):
+                    merged[k] = float(v)
+        return merged
