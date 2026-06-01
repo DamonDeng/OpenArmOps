@@ -8,7 +8,7 @@ Two pieces work together:
 
 ## Where the perf log lives
 
-`~/.openarm_ui_config/perf_logs/motion_perf_<YYYYMMDD_HHMMSS>.csv`
+`openarm_controller_ui_lerobot/local_data/perf_logs/motion_perf_<YYYYMMDD_HHMMSS>.csv`
 
 One row per tick. Columns:
 
@@ -36,7 +36,7 @@ perf n=148 total= 11.5/ 14.2/ 28.1 ... send=  6.3/  8.1/ 18.4  (med/p95/max ms)
 
 ```
 python3 -m openarm_controller_ui_lerobot.tools.replay_vr_log \
-    ~/.openarm_ui_config/vr_recordings/vr_log_<...>.jsonl
+    openarm_controller_ui_lerobot/local_data/vr_recordings/vr_log_<...>.jsonl
 ```
 
 Sends each packet at its recorded `t` (monotonic seconds). Defaults to

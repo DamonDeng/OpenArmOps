@@ -23,3 +23,9 @@ snapshots/
 # the live recorder and large enough to bloat the repo, so we don't
 # commit them.
 vr_recordings_backup/
+
+# Diagnostic / replay artefacts: live VR recordings and motion-worker
+# perf-log CSVs. Live next to the code (so config.py's references to
+# specific recording filenames are obvious) but the data itself is
+# session-specific and reproducible — keep it out of the repo.
+local_data/

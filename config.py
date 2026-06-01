@@ -110,21 +110,32 @@ TRAJECTORY_STALENESS_SEC = 0.5
 
 # ── User-writable session config ──────────────────────────────────────
 # Persisted runtime-tunable settings (max speed, gravity comp scale, …).
-# Lives outside the package so rebuilds don't clobber it and so we don't
-# pollute the repo with per-user values.
+# Lives in the user's home dir, NOT the repo, because these are
+# per-user preferences — different operators / different machines
+# should each have their own values, and a `git clean -dfx` should
+# not nuke them.
 SESSION_CONFIG_DIR = Path.home() / ".openarm_ui_config"
 SESSION_CONFIG_PATH = SESSION_CONFIG_DIR / "motion_settings.json"
+
+# ── Diagnostic / replay artefacts ─────────────────────────────────────
+# VR recordings and perf logs are session artefacts that are only
+# useful in the context of the code that produced them — config.py
+# already references specific recording filenames as the source of
+# truth for the VR axis remap. Living next to the code makes the
+# back-references obvious; ``.gitignore`` keeps the actual data out
+# of the repo.
+LOCAL_DATA_DIR = PACKAGE_DIR / "local_data"
 
 # VR recording artefacts. JSON Lines (one record per line) so the file
 # can be tailed live, grepped, and replayed by a future tool with
 # minimal parsing.
-VR_RECORDINGS_DIR = SESSION_CONFIG_DIR / "vr_recordings"
+VR_RECORDINGS_DIR = LOCAL_DATA_DIR / "vr_recordings"
 
 # Motion-worker performance logs. CSV per session, one row per tick
 # (~80 bytes; ~9 kB/s at 30 Hz). Used to diagnose tick-rate issues
 # like "do we really sustain 30 Hz with both arms enabled?". Also
 # the source for the periodic summary line on the standard logger.
-PERF_LOG_DIR = SESSION_CONFIG_DIR / "perf_logs"
+PERF_LOG_DIR = LOCAL_DATA_DIR / "perf_logs"
 # How often to roll up the per-tick numbers into a single INFO-level
 # summary line (median / p95 / max per stage). Set to 0 to disable.
 PERF_LOG_SUMMARY_INTERVAL_SEC = 5.0
