@@ -120,6 +120,15 @@ SESSION_CONFIG_PATH = SESSION_CONFIG_DIR / "motion_settings.json"
 # minimal parsing.
 VR_RECORDINGS_DIR = SESSION_CONFIG_DIR / "vr_recordings"
 
+# Motion-worker performance logs. CSV per session, one row per tick
+# (~80 bytes; ~9 kB/s at 30 Hz). Used to diagnose tick-rate issues
+# like "do we really sustain 30 Hz with both arms enabled?". Also
+# the source for the periodic summary line on the standard logger.
+PERF_LOG_DIR = SESSION_CONFIG_DIR / "perf_logs"
+# How often to roll up the per-tick numbers into a single INFO-level
+# summary line (median / p95 / max per stage). Set to 0 to disable.
+PERF_LOG_SUMMARY_INTERVAL_SEC = 5.0
+
 # ── VR input (Pico 4 Ultra APK over UDP) ──────────────────────────────
 # The openarmx_teleop_vr_apk APK streams controller + head poses to
 # this port as ASCII-space-delimited datagrams. The protocol is one

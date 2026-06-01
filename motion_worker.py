@@ -42,6 +42,7 @@ from .ik_solver import (
     pose_from_xyzrpy,
     pose_to_xyzrpy,
 )
+from .motion_perf_log import MotionPerfLogger
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
 from .vr_absolute_tracker import VRAbsoluteTracker
@@ -314,6 +315,9 @@ class MotionWorker(QThread):
         self._vr_absolute: dict[str, bool] = {"left": False, "right": False}
         self._vr_abs_tracker = VRAbsoluteTracker()
 
+        # Per-tick perf log — opened in run(), closed in run() exit.
+        self._perf = MotionPerfLogger()
+
         # Per-arm worker pool. Left and right arms ride independent CAN
         # buses (can0 / can1), so we dispatch their MIT sends and state
         # reads in parallel rather than serially. With one tick of
@@ -456,6 +460,11 @@ class MotionWorker(QThread):
             self._ik_right = None
             logger.error(f"IK solver load failed: {e}. Cartesian mode disabled.")
 
+        try:
+            self._perf.open()
+        except Exception as e:
+            logger.warning(f"motion perf log unavailable ({e}); continuing without it")
+
         next_tick = time.perf_counter()
         while not self._stop_flag:
             try:
@@ -478,15 +487,30 @@ class MotionWorker(QThread):
         # can't outlive the worker thread and try to use a torn-down
         # robot service.
         self._can_pool.shutdown(wait=True)
+        self._perf.close()
         logger.info("MotionWorker exiting")
 
     def _tick_once(self) -> None:
+        # Per-tick stage timings → CSV + periodic INFO summary.
+        self._perf.tick_begin()
+
         # 1. Drain pending commands from the UI
+        t0 = time.perf_counter()
         self._drain_commands()
+        self._perf.stage("drain_cmd", (time.perf_counter() - t0) * 1000.0)
 
         # 2. Read motor state (state-only; cameras are handled on UI thread)
+        t0 = time.perf_counter()
         current = self._read_state()
+        self._perf.stage("read_state", (time.perf_counter() - t0) * 1000.0)
         if current is None:
+            # Still flush a row so we can see "skipped" ticks in the CSV.
+            self._perf.tick_end(
+                vr_left_on=self._vr_enabled["left"],
+                vr_right_on=self._vr_enabled["right"],
+                cart_left_on=self._mode["left"] == "cartesian",
+                cart_right_on=self._mode["right"] == "cartesian",
+            )
             return  # transient read error; keep ticking, try next time
         self._last_current = current
 
@@ -507,10 +531,12 @@ class MotionWorker(QThread):
         for arm in ("left", "right"):
             if not self._vr_enabled[arm]:
                 continue
+            t0 = time.perf_counter()
             if self._vr_absolute[arm]:
                 self._vr_tick_absolute(arm)
             else:
                 self._vr_tick(arm)
+            self._perf.stage(f"vr_{arm}", (time.perf_counter() - t0) * 1000.0)
 
         # 3b. For arms in cartesian mode, solve IK once and write the
         # resulting joint angles as new targets. The rest of the tick
@@ -518,9 +544,12 @@ class MotionWorker(QThread):
         for arm in ("left", "right"):
             if self._mode[arm] != "cartesian":
                 continue
+            t0 = time.perf_counter()
             self._cartesian_tick(arm, current)
+            self._perf.stage(f"cart_{arm}", (time.perf_counter() - t0) * 1000.0)
 
         # 4. Build the action dict from torque-ON joints' trajectories
+        t0 = time.perf_counter()
         action: dict[str, float] = {}
         for key, traj in self._trajectories.items():
             arm = "right" if key.startswith("right_") else "left"
@@ -552,6 +581,7 @@ class MotionWorker(QThread):
             action[key] = setpoint
             if not lagging:
                 traj.advance()
+        self._perf.stage("action_build", (time.perf_counter() - t0) * 1000.0)
 
         # 5. Publish state to UI (thread-safe Qt signal)
         self.state_updated.emit(dict(current))
@@ -559,8 +589,17 @@ class MotionWorker(QThread):
         # 6. Send one MIT batch per arm, folding in gravity comp torques.
         # We bypass robot.send_action() because it hardcodes tau_ff=0 and
         # we want the Damiao MIT packet's torque feedforward slot.
+        t0 = time.perf_counter()
         if action:
             self._send_mit_batches(action, current)
+        self._perf.stage("send", (time.perf_counter() - t0) * 1000.0)
+
+        self._perf.tick_end(
+            vr_left_on=self._vr_enabled["left"],
+            vr_right_on=self._vr_enabled["right"],
+            cart_left_on=self._mode["left"] == "cartesian",
+            cart_right_on=self._mode["right"] == "cartesian",
+        )
 
     def _send_mit_batches(
         self,
