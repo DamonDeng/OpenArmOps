@@ -39,6 +39,7 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "vr_pos_scale",
     "vr_rot_scale",
     "vr_receiver_backend",
+    "ik_boundary_fallback_enabled",
 )
 
 
@@ -110,6 +111,11 @@ def load_session(
                 raise ValueError(
                     f"{path}: field '{name}' must be a string, got {value!r}"
                 )
+        elif type_name == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"{path}: field '{name}' must be true/false, got {value!r}"
+                )
         setattr(state, name, value)
         applied[name] = value
 
@@ -130,6 +136,7 @@ def reset_to_defaults(state: RuntimeState) -> dict[str, object]:
         "vr_pos_scale": config.INITIAL_VR_POS_SCALE,
         "vr_rot_scale": config.INITIAL_VR_ROT_SCALE,
         "vr_receiver_backend": config.VR_RECEIVER_BACKEND,
+        "ik_boundary_fallback_enabled": config.INITIAL_IK_BOUNDARY_FALLBACK_ENABLED,
     }
     applied: dict[str, object] = {}
     for name in PERSISTED_FIELDS:

@@ -276,6 +276,22 @@ class SystemTab(QWidget):
         self.vr_rot_spin.valueChanged.connect(self._on_vr_rot_scale_changed)
         speed_form.addRow("VR rotation gain:", self.vr_rot_spin)
 
+        # IK boundary-clamp fallback toggle (pass 3). When checked,
+        # unreachable cartesian targets get walked back to the workspace
+        # edge instead of freezing the arm. Off matches pre-pass-3
+        # behavior so operators can A/B the feel.
+        self.ik_boundary_check = QCheckBox(
+            "IK boundary fallback (extend toward unreachable targets)"
+        )
+        self.ik_boundary_check.setChecked(self.state.ik_boundary_fallback_enabled)
+        self.ik_boundary_check.setToolTip(
+            "When ON, the arm extends toward targets past its reach with "
+            "strict orientation, stopping at the workspace edge. When OFF, "
+            "unreachable targets freeze the arm (pre-2026-06-02 behavior)."
+        )
+        self.ik_boundary_check.toggled.connect(self._on_ik_boundary_toggled)
+        speed_form.addRow("", self.ik_boundary_check)
+
         speed_outer.addWidget(speed_form_widget)
 
         # Save / Load / Reset persistence row.
@@ -445,6 +461,14 @@ class SystemTab(QWidget):
         self.state.vr_rot_scale = float(value)
         logger.info(f"VR rotation gain set to {value:.2f}")
 
+    def _on_ik_boundary_toggled(self, checked: bool) -> None:
+        self.state.ik_boundary_fallback_enabled = bool(checked)
+        logger.info(
+            f"IK boundary fallback {'ENABLED' if checked else 'DISABLED'} "
+            f"(unreachable targets will "
+            f"{'extend toward the boundary' if checked else 'freeze the arm'})"
+        )
+
     def _on_vr_backend_changed(self, _index: int) -> None:
         """User picked a new VR receiver backend. We can't swap the
         running receiver thread mid-flight (it's referenced by the
@@ -487,6 +511,10 @@ class SystemTab(QWidget):
             spin.blockSignals(True)
             spin.setValue(float(value))
             spin.blockSignals(False)
+        # Mirror the boolean toggle without triggering its slot.
+        self.ik_boundary_check.blockSignals(True)
+        self.ik_boundary_check.setChecked(bool(self.state.ik_boundary_fallback_enabled))
+        self.ik_boundary_check.blockSignals(False)
         # Re-sync the backend combo too — load/reset can change it.
         target_key = self.state.vr_receiver_backend
         for i in range(self.vr_backend_combo.count()):

@@ -232,6 +232,15 @@ VR_SCALE_MIN = 0.05
 VR_SCALE_MAX = 5.0
 VR_SCALE_STEP = 0.05
 
+# IK boundary-clamp fallback (ik_solver pass 3). When enabled, IK
+# targets past the workspace are walked back to the boundary along
+# the current→target line, holding orientation strict — the arm
+# extends toward the operator's hand instead of freezing. Costs up
+# to 5 extra DLS solves per IK call. Disabled is the pre-2026-06-02
+# behavior (freeze on unreachable). Toggleable from the System tab
+# so operators can A/B the feel on hardware.
+INITIAL_IK_BOUNDARY_FALLBACK_ENABLED = True
+
 # Translation axis remap between the Pico/Unity OpenXR world frame
 # (+X right, +Y up, +Z forward, left-handed) and our robot world frame
 # (+X forward, +Y left, +Z up). Applied per-arm as:

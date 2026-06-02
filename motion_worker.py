@@ -1060,7 +1060,10 @@ class MotionWorker(QThread):
             target.x, target.y, target.z,
             target.roll, target.pitch, target.yaw,
         )
-        result: IKResult = solver.solve(pose, q_seed_deg_7=seed)
+        result: IKResult = solver.solve(
+            pose, q_seed_deg_7=seed,
+            boundary_fallback=self.runtime.ik_boundary_fallback_enabled,
+        )
 
         # The strict 6-DOF solve might fail (request was unreachable at
         # the requested orientation) but the position-priority fallback

@@ -31,6 +31,13 @@ class RuntimeState:
     # it at runtime would require tearing down the receiver thread,
     # so the System tab UI marks the change as "applies on restart".
     vr_receiver_backend: str = config.VR_RECEIVER_BACKEND
+    # Enable/disable the IK boundary-clamp fallback (pass 3). When
+    # True, unreachable targets are walked back along the line of
+    # approach to the workspace edge; the arm extends instead of
+    # freezing. When False, unreachable targets freeze the arm
+    # (pre-pass-3 behavior). Toggle exists so the user can A/B
+    # the feel on hardware.
+    ik_boundary_fallback_enabled: bool = config.INITIAL_IK_BOUNDARY_FALLBACK_ENABLED
 
     def max_step_per_tick(self, poll_hz: int = config.POLL_HZ) -> float:
         """Max degrees the commanded value can move per poll tick."""

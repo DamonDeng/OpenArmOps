@@ -159,7 +159,12 @@ class CartesianIKSolver:
         pin.framesForwardKinematics(self.model, self.data, q)
         return self.data.oMf[self._tcp_fid].copy()
 
-    def solve(self, target_pose: pin.SE3, q_seed_deg_7: list[float]) -> IKResult:
+    def solve(
+        self,
+        target_pose: pin.SE3,
+        q_seed_deg_7: list[float],
+        boundary_fallback: bool = True,
+    ) -> IKResult:
         """Solve IK for a single target. Position is the priority metric.
 
         Strategy:
@@ -174,6 +179,12 @@ class CartesianIKSolver:
              deltas; rotation often comes along passively. We never
              pick a result with a worse position just because its
              rotation was a bit better.)
+          5. If both passes left position past _USABLE_POS_TOL and
+             ``boundary_fallback`` is True, run pass 3 — bisection on
+             t in (0, 1] for partial-position targets — and return the
+             largest reachable fraction with strict orientation. With
+             ``boundary_fallback=False`` this step is skipped and the
+             arm freezes on unreachable targets (pre-pass-3 behavior).
         """
         q = np.zeros(self.model.nq)
         for i, v in enumerate(q_seed_deg_7):
@@ -249,8 +260,11 @@ class CartesianIKSolver:
         # while holding orientation strict, and find the largest t in
         # (0, 1] that gives a usable strict-6DOF solve. Result is the
         # arm extending toward the user's hand, stopping at the edge.
-        boundary_result = self._boundary_bisect(
-            q.copy(), q_seed_arr.copy(), target_pose,
+        # Skipped when boundary_fallback=False (caller wants the
+        # pre-pass-3 freeze-on-unreachable behavior).
+        boundary_result = (
+            self._boundary_bisect(q.copy(), q_seed_arr.copy(), target_pose)
+            if boundary_fallback else None
         )
         if boundary_result is not None:
             q_b, pos_err_b, rot_err_b, iters_b = boundary_result
