@@ -52,6 +52,11 @@ _CSV_HEADER: tuple[str, ...] = (
     "vr_right_on",
     "cart_left_on",
     "cart_right_on",
+    # Counts of joints whose setpoint hit the lead cap this tick (per
+    # arm, 0..8 each). Non-zero means the trajectory was paused
+    # because the motor couldn't keep up with the commanded speed.
+    "lead_cap_left",
+    "lead_cap_right",
 )
 
 
@@ -149,6 +154,8 @@ class MotionPerfLogger:
         vr_right_on: bool = False,
         cart_left_on: bool = False,
         cart_right_on: bool = False,
+        lead_cap_left: int = 0,
+        lead_cap_right: int = 0,
     ) -> None:
         """Close out the current tick: write a CSV row and roll into the
         summary window. Cheap (no fsync, no flush per row).
@@ -168,6 +175,8 @@ class MotionPerfLogger:
             int(vr_right_on),
             int(cart_left_on),
             int(cart_right_on),
+            int(lead_cap_left),
+            int(lead_cap_right),
         ]
         try:
             self._writer.writerow(row)

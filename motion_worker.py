@@ -551,6 +551,7 @@ class MotionWorker(QThread):
         # 4. Build the action dict from torque-ON joints' trajectories
         t0 = time.perf_counter()
         action: dict[str, float] = {}
+        lead_cap_per_arm = {"left": 0, "right": 0}
         for key, traj in self._trajectories.items():
             arm = "right" if key.startswith("right_") else "left"
             cur = current.get(key)
@@ -581,6 +582,8 @@ class MotionWorker(QThread):
             action[key] = setpoint
             if not lagging:
                 traj.advance()
+            else:
+                lead_cap_per_arm[arm] += 1
         self._perf.stage("action_build", (time.perf_counter() - t0) * 1000.0)
 
         # 5. Publish state to UI (thread-safe Qt signal)
@@ -599,6 +602,8 @@ class MotionWorker(QThread):
             vr_right_on=self._vr_enabled["right"],
             cart_left_on=self._mode["left"] == "cartesian",
             cart_right_on=self._mode["right"] == "cartesian",
+            lead_cap_left=lead_cap_per_arm["left"],
+            lead_cap_right=lead_cap_per_arm["right"],
         )
 
     def _send_mit_batches(
