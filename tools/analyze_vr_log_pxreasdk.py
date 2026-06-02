@@ -187,6 +187,8 @@ class ArmStats:
     n_position_priority: int = 0
     n_clamped: int = 0
     n_unusable: int = 0
+    n_boundary_clamped: int = 0   # rotation-priority pass-3 fallback fired
+    boundary_pos_err_mm: list[float] = field(default_factory=list)
 
     # Distribution of IK errors (only for solves we ran).
     pos_err_mm: list[float] = field(default_factory=list)
@@ -398,6 +400,9 @@ class ArmReplay:
             s.n_clamped += 1
         if ik.position_priority_used:
             s.n_position_priority += 1
+        if getattr(ik, "boundary_clamped", False):
+            s.n_boundary_clamped += 1
+            s.boundary_pos_err_mm.append(ik.pos_err_mm)
         if ik.converged:
             s.n_strict_converged += 1
         s.pos_err_mm.append(ik.pos_err_mm)
@@ -466,6 +471,12 @@ def print_summary(arms: dict[str, ArmReplay], duration: float, n_frames: int) ->
                   f"({100*s.n_clamped/s.n_solves:5.1f}%)")
             print(f"    IK unusable (would freeze): {s.n_unusable:4d}  "
                   f"({100*s.n_unusable/s.n_solves:5.1f}%)")
+            print(f"    IK boundary-clamped     : {s.n_boundary_clamped:6d}  "
+                  f"({100*s.n_boundary_clamped/s.n_solves:5.1f}%)")
+            if s.boundary_pos_err_mm:
+                med, mean, p95, mx = _stats_for(s.boundary_pos_err_mm)
+                print(f"      boundary pos_err mm   med={med:7.1f}  mean={mean:7.1f}"
+                      f"  p95={p95:7.1f}  max={mx:7.1f}  (distance to original target)")
             med, mean, p95, mx = _stats_for(s.pos_err_mm)
             print(f"    pos_err mm  med={med:7.3f}  mean={mean:7.3f}  "
                   f"p95={p95:7.3f}  max={mx:7.3f}")

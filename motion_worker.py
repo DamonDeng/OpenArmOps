@@ -285,6 +285,12 @@ class MotionWorker(QThread):
         # keep the arm pinned to its last good joint target until either
         # the target changes or the user fixes the pose.
         self._ik_failed: dict[str, bool] = {"left": False, "right": False}
+        # Sticky flag for the rotation-priority boundary fallback. True
+        # after IK returned boundary_clamped=True (target past workspace,
+        # arm is extending toward it with strict orientation). Cleared
+        # the next tick a normal solve succeeds. Used so we only emit
+        # one "workspace edge" UI cue per stretch rather than per tick.
+        self._ik_boundary: dict[str, bool] = {"left": False, "right": False}
 
         # Per-arm VR-control hard enable.
         self._vr_enabled: dict[str, bool] = {"left": False, "right": False}
@@ -1086,13 +1092,31 @@ class MotionWorker(QThread):
                 logger.warning(f"{arm}: IK solution clamped to joint limits")
                 self.send_error.emit(f"{arm}: IK solution clamped to joint limits")
             self._ik_failed[arm] = True
+        elif result.boundary_clamped:
+            # Workspace edge: target was past the reachable region; the
+            # solver returned the largest reachable fraction along the
+            # current→target line, with strict orientation preserved.
+            # Arm extends toward operator's hand instead of freezing.
+            if not self._ik_boundary[arm]:
+                logger.info(
+                    f"{arm}: workspace edge — target ~{result.pos_err_mm:.0f}mm "
+                    f"past reach; extending in target direction with strict "
+                    f"orientation."
+                )
+                self.send_error.emit(f"{arm}: workspace edge")
+            self._ik_boundary[arm] = True
+            # Not a freeze; keep _ik_failed clear so the next normal
+            # solve doesn't trip the "IK recovered" log on every tick.
+            if self._ik_failed[arm]:
+                self._ik_failed[arm] = False
         else:
             # Healthy: either strict converged, or position-priority
             # found a usable solution. Clear any stale warning.
-            if self._ik_failed[arm]:
+            if self._ik_failed[arm] or self._ik_boundary[arm]:
                 logger.info(f"{arm}: IK recovered")
                 self.send_error.emit("")
             self._ik_failed[arm] = False
+            self._ik_boundary[arm] = False
 
         self._last_ik_q_deg[arm] = list(result.q_deg)
 
@@ -1175,6 +1199,7 @@ class MotionWorker(QThread):
                     # so the next tick starts fresh.
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
+                    self._ik_boundary[arm] = False
                     logger.info(f"{arm}: mode set to {mode}")
             elif cmd.kind == "set_cart_target":
                 if cmd.arm in self._cart_target:
@@ -1193,6 +1218,7 @@ class MotionWorker(QThread):
                     self._mode[arm] = "cartesian"
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
+                    self._ik_boundary[arm] = False
                     fk = self.compute_fk(arm)
                     if fk is not None:
                         x, y, z, roll, pitch, yaw = pose_to_xyzrpy(fk)
@@ -1257,6 +1283,7 @@ class MotionWorker(QThread):
                     self._cart_target[arm] = None
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
+                    self._ik_boundary[arm] = False
                     self._vr_enabled[arm] = False
                     self._vr_snapshot[arm] = None
                     self._vr_filt_pose[arm] = None

@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pinocchio as pin
@@ -71,6 +72,19 @@ _USABLE_ROT_TOL_RELAXED = math.radians(120.0)  # generous ceiling when
                                                 # play (only catches truly
                                                 # unreachable wrist poses)
 
+# Boundary-clamp fallback (pass 3). Runs when both strict and
+# position-priority passes fail "usable" — the requested pose is past
+# the arm's workspace. Instead of freezing, walk the position back
+# along the line from current EE toward the requested target while
+# holding rotation strict, and pick the largest fraction t ∈ (0, 1]
+# that's reachable. Result: arm stretches toward the target with
+# correct wrist orientation, stopping at the workspace edge rather
+# than freezing mid-motion.
+_BOUNDARY_BISECT_ITERS = 5    # 5 IK calls → t precision ~0.03 (~3% of delta)
+_BOUNDARY_MIN_DELTA_M = 1e-3  # if requested - current is <1 mm, the issue
+                              # isn't position reach (probably orientation
+                              # or seed); skip the fallback.
+
 
 @dataclass
 class IKResult:
@@ -88,6 +102,14 @@ class IKResult:
     # Was a position-priority fallback pass run? Useful for telemetry
     # and so the UI can mention "orientation relaxed to reach target".
     position_priority_used: bool = False
+    # True when both strict and position-priority were unusable, and the
+    # boundary bisection (pass 3) returned the largest reachable
+    # fraction along the line from current EE to the requested position.
+    # The arm can still be driven (orientation is strict, position is
+    # the partial target) — the caller should treat this as a soft
+    # "workspace edge" rather than a freeze. The remaining distance to
+    # the original requested position is in pos_err_mm.
+    boundary_clamped: bool = False
 
 
 class CartesianIKSolver:
@@ -195,16 +217,57 @@ class CartesianIKSolver:
         # gives us.
         strict_meaningfully_better = pos_err_strict + 1e-4 < pos_err_relaxed
 
+        # Pick which of the first two passes is the better candidate.
+        # Used both for the early-return path and as the fallback if
+        # the boundary bisection (pass 3) finds nothing.
         if strict_meaningfully_better:
+            best_q = q_strict
+            best_pos_err = pos_err_strict
+            best_rot_err = rot_err_strict
+            best_iters = iters_strict
+            best_pos_priority = False
+        else:
+            best_q = q_relaxed
+            best_pos_err = pos_err_relaxed
+            best_rot_err = rot_err_relaxed
+            best_iters = iters_strict + iters_relaxed
+            best_pos_priority = True
+
+        # If either of the first two passes was good enough on
+        # POSITION, we don't need the boundary bisection — usability
+        # already passes (see _finalize_result). Return now.
+        if best_pos_err < _USABLE_POS_TOL:
             return self._finalize_result(
-                q_strict, pos_err_strict, rot_err_strict, iters_strict,
-                converged=False, position_priority_used=False,
+                best_q, best_pos_err, best_rot_err, best_iters,
+                converged=False, position_priority_used=best_pos_priority,
                 target_pose=target_pose,
             )
+
+        # Pass 3: boundary bisection. Both strict and relaxed left
+        # position too far from target — the request is past the
+        # workspace. Walk the position back along (current_ee → target)
+        # while holding orientation strict, and find the largest t in
+        # (0, 1] that gives a usable strict-6DOF solve. Result is the
+        # arm extending toward the user's hand, stopping at the edge.
+        boundary_result = self._boundary_bisect(
+            q.copy(), q_seed_arr.copy(), target_pose,
+        )
+        if boundary_result is not None:
+            q_b, pos_err_b, rot_err_b, iters_b = boundary_result
+            return self._finalize_result(
+                q_b, pos_err_b, rot_err_b,
+                iters_strict + iters_relaxed + iters_b,
+                converged=False, position_priority_used=False,
+                target_pose=target_pose,
+                boundary_clamped=True,
+            )
+
+        # Boundary bisection found nothing reachable along the line
+        # — fall back to whichever of the first two passes had lower
+        # position error. Caller will see usable=False and freeze.
         return self._finalize_result(
-            q_relaxed, pos_err_relaxed, rot_err_relaxed,
-            iters_strict + iters_relaxed,
-            converged=False, position_priority_used=True,
+            best_q, best_pos_err, best_rot_err, best_iters,
+            converged=False, position_priority_used=best_pos_priority,
             target_pose=target_pose,
         )
 
@@ -305,6 +368,67 @@ class CartesianIKSolver:
 
         return q, pos_err_m, rot_err_rad, it + 1
 
+    def _boundary_bisect(
+        self,
+        q_seed: np.ndarray,
+        q_seed_orig: np.ndarray,
+        target_pose: pin.SE3,
+    ) -> Optional[tuple[np.ndarray, float, float, int]]:
+        """Pass 3: line-search the largest reachable fraction toward the
+        target while holding orientation strict.
+
+        Returns (q, pos_err_to_partial_target, rot_err_to_partial_target,
+        total_iters) for the best found t, or None if no t > 0 produces
+        a usable strict-6DOF solve.
+
+        ``q_seed`` is the joint config to use both for FK (current EE)
+        and as the warm-start for the inner IK calls. We use the seed
+        rather than the strict-pass result because the strict pass
+        likely converged to a contorted joint config trying to reach
+        an unreachable pose.
+        """
+        # Current EE pose (FK on seed q).
+        pin.framesForwardKinematics(self.model, self.data, q_seed)
+        current_pose = self.data.oMf[self._tcp_fid].copy()
+        delta = target_pose.translation - current_pose.translation
+        if float(np.linalg.norm(delta)) < _BOUNDARY_MIN_DELTA_M:
+            # Position barely moved — bisection has nothing to do.
+            return None
+
+        target_rot = target_pose.rotation
+        total_iters = 0
+        # Bisection on t ∈ (0, 1]. lo is the largest known-reachable
+        # fraction, hi is the smallest known-unreachable. Start by
+        # probing t=1 (already known unreachable from passes 1+2) and
+        # bisect downward. Result of each probe = (q, pos_err, rot_err).
+        lo = 0.0
+        hi = 1.0
+        best: Optional[tuple[np.ndarray, float, float]] = None
+        # First probe at t=0.5, then bisect for _BOUNDARY_BISECT_ITERS-1
+        # rounds. With 5 total probes we narrow t to ~1/32 of the delta.
+        t = 0.5
+        for _ in range(_BOUNDARY_BISECT_ITERS):
+            partial_pos = current_pose.translation + t * delta
+            partial_pose = pin.SE3(target_rot, partial_pos)
+            q_try, pos_err, rot_err, iters = self._iterate(
+                q_seed_orig.copy(), partial_pose, position_only=False,
+            )
+            total_iters += iters
+            usable = (pos_err < _USABLE_POS_TOL
+                      and rot_err < _USABLE_ROT_TOL_STRICT)
+            if usable:
+                best = (q_try, pos_err, rot_err)
+                lo = t
+                t = (t + hi) / 2.0
+            else:
+                hi = t
+                t = (lo + t) / 2.0
+
+        if best is None:
+            return None
+        q_b, pos_err_b, rot_err_b = best
+        return q_b, pos_err_b, rot_err_b, total_iters
+
     def _finalize_result(
         self,
         q: np.ndarray,
@@ -314,6 +438,7 @@ class CartesianIKSolver:
         converged: bool,
         position_priority_used: bool,
         target_pose: pin.SE3,
+        boundary_clamped: bool = False,
     ) -> IKResult:
         """Common tail: extract our 7 joint angles, clamp to limits,
         re-evaluate position error after clamp, mark ``usable``, build
@@ -334,7 +459,11 @@ class CartesianIKSolver:
         # no longer reflects what the motors will actually produce.
         # Re-run FK on the clamped angles and recompute the residual
         # against the *target* — only that error matters for "usable".
-        if clamped:
+        # Boundary-clamped solutions also recompute against the
+        # original target (passed in `target_pose`) so pos_err_mm
+        # reports remaining distance to the user's requested point,
+        # not zero (the partial point that the bisection used).
+        if clamped or boundary_clamped:
             q_full = np.zeros(self.model.nq)
             for i, deg in enumerate(q_deg):
                 q_full[self._q_indices[i]] = np.radians(deg)
@@ -344,8 +473,8 @@ class CartesianIKSolver:
             pos_err_m = float(np.linalg.norm(err_local[:3]))
             rot_err_rad = float(np.linalg.norm(err_local[3:]))
             # Strict 6-DOF "converged" no longer applies after a clamp
-            # that increased error. Recompute against the strict
-            # thresholds.
+            # or after a boundary truncation. Recompute against the
+            # strict thresholds.
             converged = (pos_err_m < _POS_TOL and rot_err_rad < _ROT_TOL)
 
         # Usability rule:
@@ -355,9 +484,19 @@ class CartesianIKSolver:
         #     because that pass deliberately ignored it.
         #   - If strict was used, the tighter rot tolerance applies
         #     because strict was supposed to satisfy rotation too.
-        rot_tol = (_USABLE_ROT_TOL_RELAXED if position_priority_used
-                   else _USABLE_ROT_TOL_STRICT)
-        usable = (pos_err_m < _USABLE_POS_TOL and rot_err_rad < rot_tol)
+        #   - Boundary-clamped: solution is usable by definition
+        #     (the bisection only kept passes that converged with
+        #     strict tolerances on the partial target). pos_err_mm
+        #     here measures distance to the *original* target, which
+        #     is expected to exceed _USABLE_POS_TOL — that's the whole
+        #     point of this fallback. Force-mark usable so the caller
+        #     drives the arm to the boundary.
+        if boundary_clamped:
+            usable = True
+        else:
+            rot_tol = (_USABLE_ROT_TOL_RELAXED if position_priority_used
+                       else _USABLE_ROT_TOL_STRICT)
+            usable = (pos_err_m < _USABLE_POS_TOL and rot_err_rad < rot_tol)
 
         return IKResult(
             q_deg=q_deg,
@@ -368,6 +507,7 @@ class CartesianIKSolver:
             clamped=clamped,
             usable=usable,
             position_priority_used=position_priority_used,
+            boundary_clamped=boundary_clamped,
         )
 
 
