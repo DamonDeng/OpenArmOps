@@ -136,6 +136,11 @@ VR_RECORDINGS_DIR = LOCAL_DATA_DIR / "vr_recordings"
 # like "do we really sustain 30 Hz with both arms enabled?". Also
 # the source for the periodic summary line on the standard logger.
 PERF_LOG_DIR = LOCAL_DATA_DIR / "perf_logs"
+
+# Camera snapshot diagnostic dumps. The System tab's "Camera Snapshots"
+# button writes one PNG per camera (plus a swapped-R/B variant) here
+# so the user can confirm their camera is delivering RGB vs BGR.
+SNAPSHOTS_DIR = LOCAL_DATA_DIR / "snapshots"
 # How often to roll up the per-tick numbers into a single INFO-level
 # summary line (median / p95 / max per stage). Set to 0 to disable.
 PERF_LOG_SUMMARY_INTERVAL_SEC = 5.0

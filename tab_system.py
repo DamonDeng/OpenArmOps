@@ -711,7 +711,7 @@ class SystemTab(QWidget):
             self.snap_status.setText("No observation available — is the robot connected?")
             return
 
-        out_dir = Path("/home/damon/workspace/openarm_space/openarm_controller_ui_lerobot/snapshots")
+        out_dir = uiconfig.SNAPSHOTS_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
 
