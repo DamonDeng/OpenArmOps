@@ -1,109 +1,133 @@
-# OpenArm Controller UI (LeRobot direct)
+# OpenArm Controller UI
 
-A PyQt5 desktop UI that talks to the bimanual OpenArm **directly** through
-`BiOpenArmFollower` — no HTTP layer, no control server in between. The goal is
-to learn the official LeRobot motor API while having a live control surface
-for bring-up, calibration, and exploration.
+A PyQt5 desktop control surface for the **bimanual OpenArm**. Drives the
+arms directly through LeRobot's `BiOpenArmFollower` — no separate
+control server, no HTTP layer in between. Useful for bring-up,
+calibration, joint-by-joint exploration, cartesian jogging, and VR
+teleoperation.
 
-## Status
+## Features
 
-**M3-v2 — two-thread motion control (in testing).**
+- **Joint control** — keyboard and slider jogging, per-joint torque
+  toggles, go-to-zero, e-stop. Reloadable key bindings.
+- **Cartesian control** — task-space jogging in the TCP frame, driven
+  by an iterative damped-least-squares IK solver (Pinocchio) with a
+  rotation-priority workspace-edge fallback so the arm extends toward
+  unreachable targets instead of freezing.
+- **VR teleoperation** — Pico 4 / XRoboToolkit controllers stream
+  pose at 90 Hz over the PXREASDK broker; per-arm grip-clutch,
+  pose smoothing, hysteretic dead-band, and configurable position /
+  rotation scales.
+- **Gravity compensation** — torque feed-forward computed from the
+  arm's URDF so the arm holds its pose with motors-on but no command.
+- **Camera feeds** — base + per-wrist cameras with diagnostic
+  snapshot dump (helps confirm RGB vs BGR delivery).
+- **Per-tick performance log** — CSV with stage-level timings (state
+  read, IK, action build, send) plus periodic median/p95/max summaries
+  on the standard logger. Used to monitor 30 Hz control loop health.
 
-After M3's first version, we hit two problems: the closed-loop ramp stalled
-on loaded joints (gripper under load was commanded from current, so error
-stayed tiny and torque didn't grow), and the open-loop version tripped
-LeRobot's `max_relative_target` safety cap.
+## Architecture
 
-The new architecture cleanly separates time from motor tracking:
+The UI runs Qt's main loop at 5 Hz (camera-only polling). All motor
+control is driven by a separate `MotionWorker` QThread at 30 Hz that
+owns:
 
-- **MotionWorker** — dedicated QThread at 30 Hz. Owns a `JointTrajectory`
-  per joint. Each tick: drain command queue, read motor state, advance
-  every trajectory one tick (`setpoint = start + elapsed * deg_per_tick`),
-  send one MIT batch per arm.
-- **UI thread** — 5 Hz camera-only polling. Slider / keyboard / button
-  events post commands into the worker's queue. Worker emits
-  `state_updated` every tick; the tab updates "cur:" labels and amber
-  markers in that slot.
+- a `JointTrajectory` per joint (linear time-based ramp at the
+  configured `max_speed_deg_per_sec`),
+- a **lead cap** that pauses trajectory advance when the setpoint
+  would run more than 10° ahead of the motor's current position,
+- the IK solver, gravity-comp, and VR-pose pipeline.
 
-Key mechanics:
+UI events post commands into the worker's queue; the worker emits
+`state_updated` after each tick and the UI repaints. This keeps motor
+timing independent of UI thread jitter and means re-enabling torque is
+lurch-free (torque-OFF arms have their trajectories continuously reset
+to `start = target = current`).
 
-- Setpoint grows linearly in wall-clock time at `max_speed_deg_per_sec`
-  regardless of whether the motor is keeping up. If the motor lags, the
-  MIT error (`setpoint - current`) grows → torque grows → motor moves.
-  Naturally handles loaded joints without stalling.
-- **Lead cap** (`LEAD_CAP_DEG=10°`): if setpoint would be more than 10°
-  ahead of current, we pause the trajectory's time for that tick and
-  clamp the setpoint. Prevents runaway on a jammed joint.
-- Torque-OFF arms: their trajectories are continuously reset to
-  `start=target=current`, so re-enabling torque is lurch-free.
-- E-stop / torque-off / go-to-zero all post commands to the worker
-  rather than touching state directly.
+## Tabs
 
-Upcoming: keyboard shortcuts + reloadable bindings (M4), motor info
-display + editable kp/kd (M5 / v3).
-
-**Known TODO carried forward**
-
-- BiOpenArmFollower's `connect()` calls `set_zero_position()` every time,
-  so the motor zeros reset to whatever pose the arm is in at startup.
-  We should suppress that call to preserve the last calibration across
-  app restarts. Deferred.
+- **Controller (movej)** — joint-space jogging, torque toggles,
+  per-joint speed cap, calibration shortcuts.
+- **Cartesian (movel)** — task-space jogging in TCP frame.
+- **VR Info** — live readout of the VR receiver: packet rate,
+  controller poses, button states. Diagnostic only.
+- **VR Control** — enable/disable per-arm VR control, position and
+  rotation scales, absolute-mode toggle.
+- **System** — calibration, gravity-comp scale, max joint speed,
+  camera snapshots, motor configuration display.
 
 ## Prerequisites
 
-- CAN interfaces up (`can0`, `can1`) — see `start_arm.sh --stop` followed by `openarm-can-configure-socketcan` as done elsewhere in the repo.
-- Arms powered and physically in a safe rest pose (torque will briefly engage during `connect()` before we disable it).
-- `PyQt5` installed (already present on this machine).
-- **No other process holding the CAN bus or cameras** — the UI owns the robot for its lifetime.
+- CAN interfaces (`can0`, `can1`) brought up with the appropriate
+  bitrate. The OpenArm CAN-configure tool from the parent project
+  handles this; see your distribution's setup script.
+- Both arms powered and physically in a safe rest pose. Connecting
+  briefly engages torque before the UI disables it; keep hands clear
+  during startup.
+- Python 3.10+, `PyQt5`, `numpy`, `pinocchio`, `Pillow`,
+  `lerobot >= 0.5.1`. (URDF for IK / gravity-comp ships in `urdf/`.)
+- For VR teleop: a Pico 4 / Pico 4 Ultra running XRoboToolkit on the
+  same network, broadcasting controller poses to this machine.
+- No other process holding the CAN bus or cameras — the UI owns the
+  robot for its lifetime.
 
 ## Running
 
-From the repo root (`/home/damon/workspace/openarm_space`):
+From the parent directory containing this package:
 
 ```bash
 python -m openarm_controller_ui_lerobot.app
 ```
 
-Module form is required so relative imports resolve (`from . import config`).
+The module form is required so relative imports resolve.
+
+## Calibration
+
+The UI uses its own LeRobot calibration profile
+(`id="openarm_controller_ui"`). On first run, the arms report **NOT
+calibrated**. Position each arm in the canonical zero pose (hanging
+straight down, gripper closed) and click **Calibrate LEFT arm** /
+**Calibrate RIGHT arm** in the System tab. The calibration is loaded
+automatically on every subsequent launch.
+
+## Configuration
+
+- **`~/.openarm_ui_config/motion_settings.json`** — persisted runtime
+  settings: `max_speed_deg_per_sec`, gravity-comp scale, VR position
+  / rotation scales, VR receiver backend.
+- **`key_bindings.json`** — joint-jog key map (reloadable from the UI).
+- **`config.py`** — hard-coded defaults: motion tick rate, lead cap,
+  IK tolerances, dead-band thresholds, VR axis remap.
+- **`local_data/`** — diagnostic artefacts (perf logs, VR recordings,
+  camera snapshots). Gitignored; safe to delete.
 
 ## Layout
 
 ```
 openarm_controller_ui_lerobot/
-    __init__.py
-    app.py              # entry point, main window, robot lifecycle
-    config.py           # hardware constants, UI defaults
-    robot_service.py    # thread-safe BiOpenArmFollower wrapper
-    key_bindings.py     # loader for key_bindings.json
-    key_bindings.json   # editable key→joint mapping (reloadable in UI later)
-    tab_controller.py   # Controller tab (stub in M1)
-    tab_system.py       # System tab (stub in M1)
-    README.md
+    app.py                 # entry point, main window, robot lifecycle
+    config.py              # hardware constants, paths, UI defaults
+    motion_worker.py       # 30 Hz QThread driving all motor control
+    robot_service.py       # thread-safe BiOpenArmFollower wrapper
+    runtime_state.py       # mutable settings shared with the worker
+    session_config.py      # persisted session settings (load / save)
+    ik_solver.py           # damped-least-squares Pinocchio IK
+    gravity_comp.py        # torque feed-forward from URDF
+    motion_perf_log.py     # per-tick CSV performance recorder
+    vr_input.py            # legacy UDP VR receiver
+    vr_input_pxreasdk.py   # XRoboToolkit (PXREASDK) VR receiver
+    vr_absolute_tracker.py # alternative absolute-mode VR mapping
+    key_bindings.py        # loader for key_bindings.json
+    tab_controller.py      # Controller tab (joint-space jogging)
+    tab_cartesian.py       # Cartesian tab (TCP-space jogging)
+    tab_vr.py              # VR Info tab
+    tab_vr_control.py      # VR Control tab
+    tab_system.py          # System tab (calibration, settings, snapshots)
+    urdf/                  # bimanual OpenArm description for IK / gravity comp
+    tools/                 # offline replay + log analysis utilities
+    docs/                  # design notes
 ```
 
-## Key bindings (editable)
+## License
 
-Live in `key_bindings.json`. Each row maps a single character to
-`(arm, joint, direction)`. Direction is `+1` or `-1` and gets multiplied by the
-active delta at keypress time (default 1°, Shift 3°, Ctrl 0.2°).
-
-M1 ships 8 bindings — the first two joints of each arm. You can edit the JSON
-now; the UI will reload on demand starting in M4.
-
-## First-run note
-
-The UI connects with `id="openarm_controller_ui"`, which gives it its own
-calibration files separate from the other tools in this repo. On first run,
-the arms will be reported as **NOT calibrated** (the log line at startup says
-so). Open the System tab, position each arm in the "hanging straight down,
-gripper closed" pose, and click **Calibrate LEFT arm** / **Calibrate RIGHT
-arm** one at a time. After that, the UI will load the saved calibration on
-every subsequent launch with no prompt.
-
-## Known limitations
-
-- Controller tab is a placeholder (M2 will populate it).
-- No motor info display yet (M5).
-- Connecting briefly enables torque (inside `BiOpenArmFollower.connect()`) before the UI disables it. Keep hands clear during startup.
-- Startup freezes briefly during `connect()` — no worker thread for connection yet; only calibration is off the UI thread.
-- If connection fails the app exits with code 2 after showing an error dialog.
+[MIT-0](LICENSE) — MIT No Attribution. Use this however you like.
