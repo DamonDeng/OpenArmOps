@@ -63,6 +63,17 @@ def _format_bytes(n: int) -> str:
     return f"{n / (1024 * 1024):.2f} MiB"
 
 
+def _fmt_session_field(name: str, value: object) -> str:
+    """Format a session-config field for the load/reset status line.
+
+    PERSISTED_FIELDS is now mixed-type (numeric knobs plus the string
+    vr_receiver_backend). The 2-decimal float format raised on strings.
+    """
+    if isinstance(value, float):
+        return f"{name}={value:.2f}"
+    return f"{name}={value}"
+
+
 class _CalibWorker(QObject):
     """Runs a single robot_service operation on a worker thread.
 
@@ -519,7 +530,7 @@ class SystemTab(QWidget):
             return
         self._sync_motion_spinboxes_from_state()
         if applied:
-            fields = ", ".join(f"{k}={v:.2f}" for k, v in applied.items())
+            fields = ", ".join(_fmt_session_field(k, v) for k, v in applied.items())
             self._set_motion_status(f"Loaded: {fields}")
         else:
             self._set_motion_status(
@@ -529,7 +540,7 @@ class SystemTab(QWidget):
     def _on_reset_motion_config(self) -> None:
         applied = reset_to_defaults(self.state)
         self._sync_motion_spinboxes_from_state()
-        fields = ", ".join(f"{k}={v:.2f}" for k, v in applied.items())
+        fields = ", ".join(_fmt_session_field(k, v) for k, v in applied.items())
         self._set_motion_status(f"Reset to defaults: {fields}")
 
     # ------------------------------------------------------------------

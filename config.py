@@ -210,13 +210,17 @@ VR_GRIP_ENABLE_THRESHOLD = 0.8
 # delta after frame remap so 1 cm of hand motion can drive less (or
 # more) cm of arm motion. Live-editable from the System tab; saved
 # alongside max_speed via session_config.json.
-# Default 0.7 because the OpenArm's reach (~60 cm from home) is smaller
-# than a natural human arm extension (~70-80 cm). At 1:1 the user can
-# trivially drive targets out of the workspace; at 0.7 a full-arm-reach
-# hand motion of 70 cm becomes an arm target ~50 cm from home, which
-# fits inside the reachable set with margin. Live-editable from the
-# System tab; users with cramped recordings can dial it back to 1.0.
-INITIAL_VR_POS_SCALE = 0.7  # translation gain; 1.0 = arm follows hand 1:1
+# Default 1.0 (1:1). The earlier 0.7 default was an attempt to keep
+# targets inside the OpenArm's smaller-than-human reach, but offline
+# replay of vr_log_20260602_120137 showed the asymmetric scaling
+# (0.7 translation + 1.0 rotation) made every right-arm target an
+# unnatural pose that no arm-shaped chain would naturally produce —
+# IK ran to its iter cap on 44% of solves and fell into position-
+# priority on 44%, sacrificing wrist orientation to chase position.
+# At 1.0/1.0 the median solver work drops from 40 iters to 7 and the
+# wrist tracks cleanly. Operators with cramped workspaces can lower
+# this from the System tab.
+INITIAL_VR_POS_SCALE = 1.0  # translation gain; 1.0 = arm follows hand 1:1
 INITIAL_VR_ROT_SCALE = 1.0  # rotation gain; 1.0 = arm wrist follows hand 1:1
 # Spinbox bounds in the UI.
 VR_SCALE_MIN = 0.05

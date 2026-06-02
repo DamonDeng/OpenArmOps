@@ -36,7 +36,12 @@ import pinocchio as pin
 logger = logging.getLogger(__name__)
 
 _DAMPING = 1e-6
-_MAX_ITERS = 40
+# Raised from 40 to 80 on 2026-06-02. Bench (replay_vr_log_20260602_120137,
+# 2000 right-arm targets at vr_scale 1.0/1.0): 663 µs/solve at cap=40 vs
+# 1236 µs at cap=80 — still well inside the 33 ms motion-worker budget.
+# The extra iterations rescue ~1% of genuinely-hard cases that 40 iters
+# couldn't reach; the rest converge in <10 iters either way.
+_MAX_ITERS = 80
 _POS_TOL = 1e-4      # 0.1 mm  — strict 6-DOF convergence
 _ROT_TOL = 1e-3      # ~0.06°  — strict 6-DOF convergence
 _STEP_ALPHA = 1.0    # full step per iteration
@@ -50,7 +55,16 @@ _STEP_ALPHA = 1.0    # full step per iteration
 #  - position-priority result: rotation deliberately abandoned, so
 #    we don't gate on it — just position and a generous safety
 #    ceiling so a fully-broken result still gets caught.
-_USABLE_POS_TOL = 5e-3                       # 5 mm position error
+_USABLE_POS_TOL = 10e-3                      # 10 mm position error
+# Raised from 5 mm to 10 mm on 2026-06-02 after live testing showed the
+# old threshold flagged a long tail of "barely missed" solves as
+# unusable: pos_err in the 5-8 mm range with rot_err ≈ 0° (strict
+# converged, just shy of the cutoff). 5-8 mm is below human grasping
+# precision, so freezing the arm there feels like tremor rather than
+# a real reachability problem. 10 mm still gates anything visibly
+# off-target while clearing the noise band (offline replay p95 was
+# 5.7 mm, so this admits the long tail without admitting genuine
+# unreachables which sit in the 100 mm+ range).
 _USABLE_ROT_TOL_STRICT = math.radians(15.0)  # 15° rot if strict was used
 _USABLE_ROT_TOL_RELAXED = math.radians(120.0)  # generous ceiling when
                                                 # position-priority is in
