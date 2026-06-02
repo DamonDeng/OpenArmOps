@@ -750,6 +750,7 @@ class MotionWorker(QThread):
         state = self.vr_receiver.left() if arm == "left" else self.vr_receiver.right()
         if not state.has_ever_been_seen:
             return
+        self.vr_receiver.mark_consumed(arm, state.ts_ns)
 
         grip_engaged = state.grip >= config.VR_GRIP_ENABLE_THRESHOLD
 
@@ -879,6 +880,7 @@ class MotionWorker(QThread):
         state = self.vr_receiver.left() if arm == "left" else self.vr_receiver.right()
         if not state.has_ever_been_seen:
             return
+        self.vr_receiver.mark_consumed(arm, state.ts_ns)
 
         grip_engaged = state.grip >= config.VR_GRIP_ENABLE_THRESHOLD
 

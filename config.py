@@ -149,6 +149,22 @@ PERF_LOG_SUMMARY_INTERVAL_SEC = 5.0
 VR_UDP_BIND_ADDR = "0.0.0.0"
 VR_UDP_PORT = 5100
 
+# VR receiver backend.
+# - "pxreasdk" (default): attach to Pico's XRoboToolkit broker
+#   (RoboticsServiceProcess) via libPXREARobotSDK.so. Sustains 90 Hz
+#   in dual-arm mode. Requires the service to be running on this host
+#   (127.0.0.1:60061) and the headset to run XRoboToolkit-Unity-Client.
+# - "udp": legacy listener for the closed-source openarmx-vr-pico.apk.
+#   Caps at ~5 Hz aggregate dual-arm; kept as a fallback. See
+#   docs/vr_packet_rate_investigation.md for the diagnosis trail.
+VR_RECEIVER_BACKEND = "pxreasdk"
+
+# Path to libPXREARobotSDK.so. The standard install location on
+# Ubuntu is /opt/apps/roboticsservice/SDK/arm64/. ctypes also tries
+# the bare basename via dlopen first, so the loader will pick this up
+# automatically when LD_LIBRARY_PATH or runService.sh has been set.
+VR_PXREASDK_LIB = "/opt/apps/roboticsservice/SDK/arm64/libPXREARobotSDK.so"
+
 # Sensor noise dead-bands — applied when the motion worker eventually
 # consumes controller deltas. Small thresholds to stop the arm from
 # chasing sensor jitter at rest.

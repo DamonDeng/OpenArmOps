@@ -33,7 +33,7 @@ from .tab_controller import ControllerTab
 from .tab_system import SystemTab
 from .tab_vr import VRTab
 from .tab_vr_control import VRControlTab
-from .vr_input import VRInputReceiver
+from .vr_input import VRInputReceiver, make_vr_receiver
 
 logger = logging.getLogger(__name__)
 
@@ -151,8 +151,14 @@ def main() -> int:
     # VR receiver is constructed before the motion worker so the worker
     # can hold a reference to it (Phase 2b-β reads controller state from
     # it each tick). We start() it after the worker starts so its logs
-    # appear after the "MotionWorker started" banner.
-    vr_receiver = VRInputReceiver()
+    # appear after the "MotionWorker started" banner. The backend is
+    # picked at startup from state.vr_receiver_backend, which the
+    # session config above has just hydrated; default is "pxreasdk".
+    vr_receiver = make_vr_receiver(state.vr_receiver_backend)
+    logger.info(
+        f"VR receiver backend: {state.vr_receiver_backend!r} "
+        f"({type(vr_receiver).__name__})"
+    )
 
     worker = MotionWorker(robot, state, vr_receiver=vr_receiver)
     worker.start()

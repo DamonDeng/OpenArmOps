@@ -1,14 +1,17 @@
 """Absolute-pose VR tracker — alternative to the snapshot/delta clutch model.
 
 Operator model:
-  - Per VR-enable cycle, the FIRST grip press locks in a single reference
-    pair: ``(ctrl_origin, arm_origin)``. Every subsequent tick (while
-    grip is engaged) computes ``arm_origin * remap(ctrl_origin^-1 * ctrl_now)``.
-  - Releasing grip does NOT clear the reference. The arm freezes at its
-    last commanded pose; re-pressing grip resumes tracking from the
-    SAME reference (so if the hand moved while grip was off the arm
-    will jump on resume — operator's responsibility to slow-go-to-zero
-    and re-enable VR before starting a fresh test).
+  - Per VR-enable cycle, the FIRST grip press locks in a reference pair
+    ``(ctrl_origin, arm_origin)``. Every subsequent tick (while grip is
+    engaged) computes ``arm_origin * remap(ctrl_origin^-1 * ctrl_now)``.
+  - Releasing grip freezes the arm. Re-pressing grip RE-SNAPSHOTS both
+    references: ``ctrl_origin = ctrl_now`` and ``arm_origin = arm_fk_now``.
+    This is required because the Pico APK silently re-zeros its world
+    frame around grip ~0.6 (see config.VR_GRIP_ENABLE_THRESHOLD), so
+    after a release/press cycle the controller pose we receive is in a
+    new APK frame that is not comparable to the pre-release reference.
+    Re-snapshotting on the rising edge anchors the new APK frame to the
+    arm's current pose, so the next tick's delta is identity → no jump.
   - Switching VR off (or e-stop) clears the reference.
 
 Vs. the relative ``_vr_tick`` path:
@@ -50,13 +53,20 @@ class VRAbsoluteTracker:
         self._ref: dict[str, Optional[_AbsoluteRef]] = {
             "left": None, "right": None,
         }
+        # Tracks grip state from the previous tick per arm so we can
+        # detect rising edges (released → engaged) and re-snapshot both
+        # references against the APK's just-reset world frame.
+        self._grip_prev: dict[str, bool] = {"left": False, "right": False}
 
     def reset(self, arm: str) -> None:
         self._ref[arm] = None
+        self._grip_prev[arm] = False
 
     def reset_all(self) -> None:
         self._ref["left"] = None
         self._ref["right"] = None
+        self._grip_prev["left"] = False
+        self._grip_prev["right"] = False
 
     def has_reference(self, arm: str) -> bool:
         return self._ref[arm] is not None
@@ -80,6 +90,10 @@ class VRAbsoluteTracker:
         the reference was already taken — the caller leaves cart_target
         at its last value, freezing the arm).
         """
+        prev_engaged = self._grip_prev[arm]
+        rising_edge = grip_engaged and not prev_engaged
+        self._grip_prev[arm] = grip_engaged
+
         ref = self._ref[arm]
 
         if ref is None:
@@ -94,6 +108,15 @@ class VRAbsoluteTracker:
         if not grip_engaged:
             # Reference exists but grip is currently released → freeze.
             return None
+
+        if rising_edge:
+            # APK silently re-zeroed its world frame while grip was below
+            # ~0.6, so ctrl_pose is in a new frame incomparable with the
+            # old ref.controller. Re-anchor: snap ctrl_origin to the
+            # current packet and arm_origin to the arm's current FK.
+            # First post-edge tick produces an identity delta → no jump.
+            self._ref[arm] = _AbsoluteRef(controller=ctrl_pose, arm=arm_fk)
+            return arm_fk
 
         delta = ref.controller.actInv(ctrl_pose)
 

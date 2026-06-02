@@ -27,6 +27,10 @@ class RuntimeState:
     # (1:1 tracking). Shared across both arms.
     vr_pos_scale: float = config.INITIAL_VR_POS_SCALE
     vr_rot_scale: float = config.INITIAL_VR_ROT_SCALE
+    # VR receiver backend selector. Picked at app startup; changing
+    # it at runtime would require tearing down the receiver thread,
+    # so the System tab UI marks the change as "applies on restart".
+    vr_receiver_backend: str = config.VR_RECEIVER_BACKEND
 
     def max_step_per_tick(self, poll_hz: int = config.POLL_HZ) -> float:
         """Max degrees the commanded value can move per poll tick."""

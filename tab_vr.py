@@ -224,12 +224,13 @@ class _StreamPanel(QGroupBox):
         self.l_total = QLabel("packets: 0")
         self.l_bytes = QLabel("bytes: 0")
         self.l_errors = QLabel("errors: 0   unknown: 0")
+        self.l_drops = QLabel("kernel drops: 0   unread overwrites: L 0  R 0")
         self.l_last = QLabel("last: never")
         self.l_mode = QLabel("mode: —")
         self.l_calib = QLabel("last calibrate: never")
 
         for lbl in (self.l_bind, self.l_source, self.l_rate, self.l_total,
-                    self.l_bytes, self.l_errors, self.l_last,
+                    self.l_bytes, self.l_errors, self.l_drops, self.l_last,
                     self.l_mode, self.l_calib):
             lbl.setFont(_mono())
 
@@ -240,12 +241,15 @@ class _StreamPanel(QGroupBox):
         g.addWidget(self.l_total,   2, 0)
         g.addWidget(self.l_bytes,   2, 1)
         g.addWidget(self.l_errors,  3, 0, 1, 2)
-        g.addWidget(self.l_mode,    4, 0)
-        g.addWidget(self.l_calib,   4, 1)
+        g.addWidget(self.l_drops,   4, 0, 1, 2)
+        g.addWidget(self.l_mode,    5, 0)
+        g.addWidget(self.l_calib,   5, 1)
 
     def update_from(
         self,
         stats: StreamStats,
+        left: ControllerState,
+        right: ControllerState,
         mode: str,
         last_calibrate: float,
         now: float,
@@ -257,6 +261,10 @@ class _StreamPanel(QGroupBox):
         self.l_bytes.setText(f"bytes: {stats.total_bytes}")
         self.l_errors.setText(
             f"errors: {stats.parse_errors}   unknown: {stats.unknown_messages}"
+        )
+        self.l_drops.setText(
+            f"kernel drops: {stats.kernel_drops}   "
+            f"unread overwrites: L {left.unread_overwrites}  R {right.unread_overwrites}"
         )
         if stats.last_rx > 0.0:
             age_ms = (now - stats.last_rx) * 1000.0
@@ -328,4 +336,4 @@ class VRTab(QWidget):
         self.left_panel.update_from(left, now)
         self.right_panel.update_from(right, now)
         self.head_panel.update_from(head, now)
-        self.stream_panel.update_from(stats, mode, last_cal, now)
+        self.stream_panel.update_from(stats, left, right, mode, last_cal, now)

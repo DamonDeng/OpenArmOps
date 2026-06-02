@@ -29,3 +29,7 @@ vr_recordings_backup/
 # specific recording filenames are obvious) but the data itself is
 # session-specific and reproducible — keep it out of the repo.
 local_data/
+
+# External repositories cloned for reference (Pico's openarmx_teleop_vr,
+# the closed-source APK binary, etc.). Large and not ours to redistribute.
+code_reference/

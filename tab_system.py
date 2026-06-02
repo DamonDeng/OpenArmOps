@@ -19,6 +19,7 @@ from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -136,6 +137,53 @@ class SystemTab(QWidget):
         self.snap_status.setStyleSheet("color: #484;")
         snap_layout.addWidget(self.snap_status)
         root.addWidget(snap_box)
+
+        # ── VR receiver backend ────────────────────────────────────
+        # Two backends are available. Switching takes effect on the
+        # next app start because the receiver thread is created in
+        # app.py before the UI exists.
+        #
+        #   pxreasdk — XRoboToolkit broker via libPXREARobotSDK.so
+        #              (requires Pico's RoboticsService to be running
+        #              on this host; sustains 90 Hz dual-arm)
+        #   udp      — legacy listener for openarmx-vr-pico.apk
+        #              (caps at ~5 Hz aggregate dual-arm)
+        backend_box = QGroupBox("VR receiver backend")
+        backend_layout = QVBoxLayout(backend_box)
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Backend:"))
+        self.vr_backend_combo = QComboBox()
+        # Tuples of (display label, internal key). pxreasdk first so
+        # it's the default Qt selection if no session config exists.
+        self._vr_backend_items = (
+            ("XRoboToolkit (PXREASDK, 90 Hz)", "pxreasdk"),
+            ("Legacy UDP APK (5 Hz dual-arm)", "udp"),
+        )
+        for label, key in self._vr_backend_items:
+            self.vr_backend_combo.addItem(label, key)
+        # Select whichever key matches state.vr_receiver_backend; fall
+        # back to first entry if the persisted value is unrecognized.
+        target_key = self.state.vr_receiver_backend
+        for i in range(self.vr_backend_combo.count()):
+            if self.vr_backend_combo.itemData(i) == target_key:
+                self.vr_backend_combo.setCurrentIndex(i)
+                break
+        self.vr_backend_combo.currentIndexChanged.connect(self._on_vr_backend_changed)
+        backend_row.addWidget(self.vr_backend_combo, 1)
+        backend_layout.addLayout(backend_row)
+        # Show what the running receiver actually is, plus a
+        # "restart required" notice when the selection has been
+        # changed. Saves the user from wondering why nothing happened.
+        active_key = type(self.vr_receiver).__name__
+        self.vr_backend_active_label = QLabel(
+            f"Currently active receiver: {active_key}"
+        )
+        self.vr_backend_active_label.setStyleSheet("color: #888;")
+        backend_layout.addWidget(self.vr_backend_active_label)
+        self.vr_backend_restart_label = QLabel("")
+        self.vr_backend_restart_label.setStyleSheet("color: #b85;")
+        backend_layout.addWidget(self.vr_backend_restart_label)
+        root.addWidget(backend_box)
 
         # ── VR packet recording (diagnostic) ────────────────────────
         # Off by default at startup. Toggle to capture every datagram
@@ -386,6 +434,33 @@ class SystemTab(QWidget):
         self.state.vr_rot_scale = float(value)
         logger.info(f"VR rotation gain set to {value:.2f}")
 
+    def _on_vr_backend_changed(self, _index: int) -> None:
+        """User picked a new VR receiver backend. We can't swap the
+        running receiver thread mid-flight (it's referenced by the
+        motion worker, the VR tab, and the controller tab — all of
+        which were wired at app start), so we just stage the choice
+        in ``state.vr_receiver_backend`` and tell the user to restart.
+        """
+        new_key = self.vr_backend_combo.currentData()
+        if not isinstance(new_key, str):
+            return
+        self.state.vr_receiver_backend = new_key
+        active_key = type(self.vr_receiver).__name__
+        # Compare against the active receiver class name; the persisted
+        # key maps onto a class via the make_vr_receiver factory.
+        active_matches = (
+            (new_key == "pxreasdk" and active_key == "PXREASDKVRReceiver")
+            or (new_key == "udp" and active_key == "UDPVRReceiver")
+        )
+        if active_matches:
+            self.vr_backend_restart_label.setText("")
+        else:
+            self.vr_backend_restart_label.setText(
+                "Restart the app to apply the new backend, then "
+                "Save motion config to make it persist across runs."
+            )
+        logger.info(f"VR receiver backend selection changed to {new_key!r} (restart required)")
+
     def _sync_motion_spinboxes_from_state(self) -> None:
         """After load/reset, push state values back into the spinboxes
         without triggering their valueChanged slots (which would just
@@ -401,6 +476,16 @@ class SystemTab(QWidget):
             spin.blockSignals(True)
             spin.setValue(float(value))
             spin.blockSignals(False)
+        # Re-sync the backend combo too — load/reset can change it.
+        target_key = self.state.vr_receiver_backend
+        for i in range(self.vr_backend_combo.count()):
+            if self.vr_backend_combo.itemData(i) == target_key:
+                self.vr_backend_combo.blockSignals(True)
+                self.vr_backend_combo.setCurrentIndex(i)
+                self.vr_backend_combo.blockSignals(False)
+                # Re-evaluate the restart-required hint.
+                self._on_vr_backend_changed(i)
+                break
 
     def _set_motion_status(self, msg: str, ok: bool = True) -> None:
         self.motion_config_status.setText(msg)

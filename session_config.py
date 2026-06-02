@@ -38,6 +38,7 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "gravity_comp_scale",
     "vr_pos_scale",
     "vr_rot_scale",
+    "vr_receiver_backend",
 )
 
 
@@ -93,15 +94,22 @@ def load_session(
             continue  # keep current value
         value = data[name]
         expected_type = type_map.get(name, None)
-        # We only have trivial types today (float). Coerce permissively
-        # — an int is fine where a float is expected.
-        if expected_type is float:
+        # Coerce permissively for the trivial types we persist today.
+        # ``from __future__ import annotations`` turns dataclass field
+        # types into string forms, so compare by name.
+        type_name = expected_type if isinstance(expected_type, str) else getattr(expected_type, "__name__", "")
+        if type_name == "float":
             try:
                 value = float(value)
             except (TypeError, ValueError) as e:
                 raise ValueError(
                     f"{path}: field '{name}' must be a number, got {value!r}"
                 ) from e
+        elif type_name == "str":
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{path}: field '{name}' must be a string, got {value!r}"
+                )
         setattr(state, name, value)
         applied[name] = value
 
@@ -121,6 +129,7 @@ def reset_to_defaults(state: RuntimeState) -> dict[str, object]:
         "gravity_comp_scale": config.INITIAL_GRAVITY_COMP_SCALE,
         "vr_pos_scale": config.INITIAL_VR_POS_SCALE,
         "vr_rot_scale": config.INITIAL_VR_ROT_SCALE,
+        "vr_receiver_backend": config.VR_RECEIVER_BACKEND,
     }
     applied: dict[str, object] = {}
     for name in PERSISTED_FIELDS:

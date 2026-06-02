@@ -1,11 +1,30 @@
-"""UDP receiver for Pico 4 Ultra controller + head poses.
+"""VR controller receiver — backend-agnostic interface + UDP backend.
 
-Protocol (wire format verified via tcpdump on 2026-05-11 against the
-openarmx_teleop_vr_apk v6 APK; coordinate frame characterized via the
-2026-05-27 three-posture recording):
+Two backend implementations live in the codebase:
 
-    Each datagram is one ASCII line, space-delimited, ending in newline
-    optional. First token identifies the payload:
+1. ``UDPVRReceiver`` (this file): the legacy receiver for the closed-
+   source ``openarmx-vr-pico.apk``. Listens on UDP port
+   ``VR_UDP_PORT`` for ASCII space-delimited datagrams. Caps out at
+   ~5 Hz aggregate in dual-arm mode due to APK-side or Wi-Fi-side
+   loss; see ``docs/vr_packet_rate_investigation.md``.
+
+2. ``PXREASDKVRReceiver`` (``vr_input_pxreasdk.py``): the new
+   default. Attaches to Pico's XRoboToolkit broker
+   (``RoboticsServiceProcess``) via ``libPXREARobotSDK.so`` and
+   consumes ``PXREADeviceStateJson`` callbacks. Sustains 90 Hz in
+   dual-arm mode. Use the factory ``make_vr_receiver()`` to
+   construct the configured backend.
+
+Both backends share the same public surface — ``ControllerState``,
+``HeadState``, ``StreamStats``, the ``state_updated`` Qt signal at
+10 Hz, and the ``snapshot``/``left``/``right``/``mark_consumed``/
+``set_recording``/``recording_stats``/``save_and_clear`` methods —
+so the rest of the app (motion worker, VR tab, controller tab, system
+tab) is backend-agnostic.
+
+UDP wire format (legacy, as the closed-source APK sent it):
+
+    Each datagram is one ASCII line, space-delimited:
 
       LEFT  tx ty tz  qx qy qz qw  trigger grip  A B X Y  rate  ts_ns
       RIGHT tx ty tz  qx qy qz qw  trigger grip  A B X Y  rate  ts_ns
@@ -13,30 +32,13 @@ openarmx_teleop_vr_apk v6 APK; coordinate frame characterized via the
       MODE  relative|absolute
       CALIBRATE_DONE
 
-    Translation metres, quaternion xyzw order, trigger/grip 0..1,
-    A/B/X/Y 0 or 1. Rate is the on-controller slider 0..1.
-
-    Coordinate frame (right-handed, as the APK actually sends — this
-    is NOT the documented OpenXR "+Y up, +Z forward" convention):
+    Coordinate frame (right-handed, as the APK actually sends —
+    NOT the documented OpenXR "+Y up, +Z forward"):
       +X = operator's right
       +Y = forward (out from the operator's body)
       +Z = up
     Origin resets at each grip rising-edge. The vr→robot remap in
-    config.VR_TRANSLATION_REMAP_RIGHT depends on this.
-
-Design:
-- One QThread owns a non-blocking UDP socket bound to VR_UDP_PORT. Polls
-  with select() so shutdown is responsive.
-- Parsed state is kept in thread-safe attributes (Python dict get/set is
-  atomic enough for our single-writer-many-reader pattern; we wrap in a
-  lock for safety anyway).
-- UI is notified via a Qt signal at a throttled rate (10 Hz) — no
-  point re-rendering faster than the eye can follow, and the incoming
-  stream is ~100 Hz.
-- Stats (packet count, rate, last-packet-age) tracked internally.
-
-Phase 2a: no motor integration. The motion worker will sample the state
-directly in Phase 2b.
+    ``config.VR_TRANSLATION_REMAP_RIGHT`` depends on this.
 """
 
 from __future__ import annotations
@@ -80,6 +82,12 @@ class ControllerState:
     rate: float = 0.0
     ts_ns: int = 0
     last_rx: float = 0.0  # our monotonic receive time (seconds)
+    # Latest ts_ns the motion worker has acknowledged via mark_consumed.
+    # When a new packet overwrites this state and the previous ts_ns was
+    # > last_consumed_ts_ns, the previous packet is being thrown away
+    # before any consumer saw it — incremented in unread_overwrites.
+    last_consumed_ts_ns: int = 0
+    unread_overwrites: int = 0
 
     @property
     def has_ever_been_seen(self) -> bool:
@@ -111,6 +119,12 @@ class StreamStats:
     parse_errors: int = 0
     last_rx: float = 0.0
     last_source: str = ""      # "192.168.3.94:35841"
+    # Kernel-side UDP drops on our bind port, sampled from /proc/net/udp.
+    # These are packets the kernel discarded before recvfrom got them
+    # (typically SO_RCVBUF overflow). Sampled once per second by the
+    # receiver thread; baselined at startup so the value is "drops since
+    # this process started", not the system-wide total since boot.
+    kernel_drops: int = 0
     # Rolling 1-second packet-count window for rate calc.
     _window: deque = field(default_factory=lambda: deque(maxlen=256))
 
@@ -132,11 +146,18 @@ class StreamStats:
 
 
 class VRInputReceiver(QThread):
-    """Listens for APK datagrams and publishes state via a Qt signal.
+    """Backend-agnostic base for VR-controller receivers.
 
-    The signal fires at ~10 Hz with a snapshot dict so the UI can render
-    current values. The signal is emitted even when no packets have
-    arrived, so the tab can show "no data" / "stream stale" states
+    Subclasses implement ``run()`` (the receiver loop) and call
+    ``_record_raw()`` / direct mutation of ``_left`` / ``_right`` /
+    ``_head`` / ``_stats`` (under ``self._lock``) plus ``_maybe_emit()``
+    once per service cycle. Public read API and the recorder live here
+    so all backends present an identical surface to the UI / motion
+    worker.
+
+    ``state_updated`` fires at ~10 Hz with a snapshot dict so the UI
+    can render current values. It is emitted even when no packets have
+    arrived, so tabs can show "no data" / "stream stale" states
     consistently.
     """
 
@@ -196,6 +217,18 @@ class VRInputReceiver(QThread):
     def right(self) -> ControllerState:
         with self._lock:
             return self._right
+
+    def mark_consumed(self, arm: str, ts_ns: int) -> None:
+        """Acknowledge that the consumer has processed a packet with this
+        ``ts_ns``. Used by the motion worker so that ``_apply_controller``
+        can tell apart "overwrites a packet that's already been used"
+        from "overwrites a packet that nobody has seen yet"; only the
+        latter increments ``unread_overwrites``.
+        """
+        with self._lock:
+            target = self._left if arm == "left" else self._right
+            if ts_ns > target.last_consumed_ts_ns:
+                target.last_consumed_ts_ns = ts_ns
 
     def stop(self) -> None:
         self._stop = True
@@ -261,12 +294,66 @@ class VRInputReceiver(QThread):
         return packets, bytes_written
 
     # ------------------------------------------------------------------
-    # Thread body
+    # Helpers shared by all backends.
     # ------------------------------------------------------------------
+    def _record_raw_packet(self, now: float, source: str, data: bytes) -> None:
+        """Append a raw payload to the recorder buffer if recording is on.
+        Cheap when disabled (one boolean check). Subclasses must call
+        this from their receive path with the original bytes so replay
+        files are wire-faithful.
+        """
+        if not self._record_enabled:
+            return
+        with self._record_lock:
+            if self._record_enabled:
+                self._record_buffer.append((now, source, data))
+                self._record_bytes += len(data)
+
+    def _maybe_emit(self) -> None:
+        """Throttle the ``state_updated`` Qt signal to ~10 Hz. Called by
+        each backend's receive loop after handling a batch of packets.
+        """
+        now = time.monotonic()
+        if now - self._last_emit < self._emit_interval:
+            return
+        self._last_emit = now
+        # Emit a shallow snapshot. dataclass instances are sent by
+        # reference across the Qt signal — the UI copies out fields it
+        # needs; no cross-thread mutation concerns since the UI only reads.
+        self.state_updated.emit(self.snapshot())
+
+    # ------------------------------------------------------------------
+    # Thread body — overridden by each concrete backend.
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        raise NotImplementedError(
+            "VRInputReceiver is abstract; use a concrete backend "
+            "(UDPVRReceiver, PXREASDKVRReceiver) or the make_vr_receiver() factory."
+        )
+
+
+class UDPVRReceiver(VRInputReceiver):
+    """Legacy UDP receiver for the closed-source openarmx-vr-pico.apk.
+
+    Listens on ``VR_UDP_PORT`` for ASCII space-delimited datagrams
+    (LEFT/RIGHT/HEAD/MODE/CALIBRATE_DONE). Capped at ~5 Hz aggregate
+    in dual-arm mode by APK / Wi-Fi loss; see
+    ``docs/vr_packet_rate_investigation.md``. Kept as a fallback for
+    operators still running the legacy APK; the default is now
+    ``PXREASDKVRReceiver``.
+    """
+
     def run(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Bump SO_RCVBUF so a brief stall in the receiver thread
+            # doesn't lose packets to kernel-buffer overflow. Default is
+            # ~212 KB on Linux 6.x; 1 MB holds ~5 s of 100 Hz traffic.
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            except OSError as e:
+                logger.warning(f"VR UDP SO_RCVBUF bump failed: {e}")
             sock.bind((config.VR_UDP_BIND_ADDR, config.VR_UDP_PORT))
         except OSError as e:
             logger.error(
@@ -279,6 +366,11 @@ class VRInputReceiver(QThread):
             f"VR receiver listening on udp://{config.VR_UDP_BIND_ADDR}:"
             f"{config.VR_UDP_PORT}"
         )
+
+        # Baseline kernel-side drops at startup so we report drops since
+        # *this process* started rather than the system-wide total.
+        kernel_drops_baseline = self._read_proc_udp_drops(config.VR_UDP_PORT)
+        next_kernel_drops_check = time.monotonic() + 1.0
 
         try:
             while not self._stop:
@@ -300,10 +392,47 @@ class VRInputReceiver(QThread):
                     except Exception as e:
                         logger.exception(f"VR recv error: {e}")
 
+                now = time.monotonic()
+                if now >= next_kernel_drops_check:
+                    abs_drops = self._read_proc_udp_drops(config.VR_UDP_PORT)
+                    if abs_drops >= 0:
+                        with self._lock:
+                            self._stats.kernel_drops = max(
+                                0, abs_drops - kernel_drops_baseline
+                            )
+                    next_kernel_drops_check = now + 1.0
+
                 self._maybe_emit()
         finally:
             sock.close()
             logger.info("VR receiver stopped")
+
+    @staticmethod
+    def _read_proc_udp_drops(port: int) -> int:
+        """Return the kernel's drop counter for our UDP bind port.
+
+        ``/proc/net/udp`` columns: ``sl  local_address  rem_address  st
+        tx_q rx_q tr tm->when retrnsmt uid timeout inode ref pointer
+        drops``. Local address is ``HEXIP:HEXPORT``. Returns -1 if the
+        port can't be found (interface down, IPv6-only bind, etc.) or
+        the file isn't readable. Cheap (one fopen + linear scan, ~few
+        hundred lines on a busy host).
+        """
+        port_hex = f"{port:04X}"
+        try:
+            with open("/proc/net/udp", "r") as f:
+                next(f, None)  # header
+                for line in f:
+                    cols = line.split()
+                    if len(cols) < 13:
+                        continue
+                    local = cols[1]
+                    if not local.endswith(":" + port_hex):
+                        continue
+                    return int(cols[12])
+        except (OSError, ValueError):
+            pass
+        return -1
 
     # ------------------------------------------------------------------
     # Packet handling
@@ -314,15 +443,8 @@ class VRInputReceiver(QThread):
         source = f"{addr[0]}:{addr[1]}"
 
         # Recorder hook: append the raw datagram (pre-parse) so the log
-        # captures every packet we received, even malformed ones. Cheap
-        # branch when disabled.
-        if self._record_enabled:
-            with self._record_lock:
-                # Re-check under the lock — set_recording could have
-                # flipped between the outer test and here.
-                if self._record_enabled:
-                    self._record_buffer.append((now, source, data))
-                    self._record_bytes += size
+        # captures every packet we received, even malformed ones.
+        self._record_raw_packet(now, source, data)
 
         try:
             line = data.decode("ascii", errors="replace").strip()
@@ -375,6 +497,11 @@ class VRInputReceiver(QThread):
         if len(tokens) < 15:
             raise ValueError(f"controller datagram too short: {len(tokens)} fields")
         with self._lock:
+            # Latest-wins overwrite tracking: if the existing state has
+            # a ts_ns the motion worker hasn't acknowledged yet, the
+            # incoming packet is about to throw it away unseen.
+            if target.last_rx > 0.0 and target.ts_ns > target.last_consumed_ts_ns:
+                target.unread_overwrites += 1
             target.tx = float(tokens[0])
             target.ty = float(tokens[1])
             target.tz = float(tokens[2])
@@ -407,15 +534,37 @@ class VRInputReceiver(QThread):
             self._head.ts_ns = int(float(tokens[7]))
             self._head.last_rx = now
 
-    # ------------------------------------------------------------------
-    # UI emit
-    # ------------------------------------------------------------------
-    def _maybe_emit(self) -> None:
-        now = time.monotonic()
-        if now - self._last_emit < self._emit_interval:
-            return
-        self._last_emit = now
-        # Emit a shallow snapshot. dataclass instances are sent by
-        # reference across the Qt signal — the UI copies out fields it
-        # needs; no cross-thread mutation concerns since the UI only reads.
-        self.state_updated.emit(self.snapshot())
+
+# ---------------------------------------------------------------------------
+# Backend factory — picks a concrete receiver based on config.
+# ---------------------------------------------------------------------------
+def make_vr_receiver(backend: Optional[str] = None) -> VRInputReceiver:
+    """Return a configured VR receiver. ``backend`` defaults to
+    ``config.VR_RECEIVER_BACKEND``. Recognized values:
+
+    - ``"pxreasdk"`` — XRoboToolkit broker via libPXREARobotSDK.so
+      (default; sustained 90 Hz, dual-arm in one frame)
+    - ``"udp"``      — legacy UDP listener for the closed-source
+      openarmx-vr-pico.apk
+
+    Falls back to UDP and logs a warning if pxreasdk is requested but
+    the SDK module fails to import (for instance if the service
+    package isn't installed on this host).
+    """
+    name = (backend or getattr(config, "VR_RECEIVER_BACKEND", "pxreasdk")).lower()
+    if name == "udp":
+        return UDPVRReceiver()
+    if name == "pxreasdk":
+        try:
+            from .vr_input_pxreasdk import PXREASDKVRReceiver
+        except Exception as e:
+            logger.error(
+                f"PXREASDK backend unavailable ({e}); falling back to UDP. "
+                "Install Pico's RoboticsService and ensure libPXREARobotSDK.so "
+                "is on LD_LIBRARY_PATH to use the high-rate path."
+            )
+            return UDPVRReceiver()
+        return PXREASDKVRReceiver()
+    logger.error(f"Unknown VR_RECEIVER_BACKEND={name!r}; falling back to UDP.")
+    return UDPVRReceiver()
+
