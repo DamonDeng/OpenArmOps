@@ -42,6 +42,7 @@ from .ik_solver import (
     pose_from_xyzrpy,
     pose_to_xyzrpy,
 )
+from .motion_cart_log import CartesianTickLogger
 from .motion_perf_log import MotionPerfLogger
 from .robot_service import RobotService
 from .runtime_state import RuntimeState
@@ -273,6 +274,16 @@ class MotionWorker(QThread):
         self._cart_target: dict[str, Optional[CartesianTarget]] = {
             "left": None, "right": None,
         }
+        # Freshness flag for _cart_target. Set when a writer (VR tick
+        # while grip engaged, absolute tracker, or set_cart_target
+        # command from the Cartesian tab) updates the target. Read and
+        # cleared at the top of _cartesian_tick. When False, the tick
+        # commands physical_q directly (true hold) — without this gate
+        # the tick keeps re-solving IK with a tiny-jitter physical_q
+        # against the last target_pose, and the half-step propagates
+        # the IK micro-noise into motor commands. Most visible after
+        # grip release: the arm trembles instead of holding still.
+        self._cart_target_fresh: dict[str, bool] = {"left": False, "right": False}
         # IK solvers — lazy-loaded with gravity comp.
         self._ik_left: Optional[CartesianIKSolver] = None
         self._ik_right: Optional[CartesianIKSolver] = None
@@ -323,6 +334,10 @@ class MotionWorker(QThread):
 
         # Per-tick perf log — opened in run(), closed in run() exit.
         self._perf = MotionPerfLogger()
+        # Per-tick-per-arm cartesian decision log. Captures the IK
+        # input/output/decision chain so trembling can be diagnosed
+        # offline from the CSV.
+        self._cart_log = CartesianTickLogger()
 
         # Per-arm worker pool. Left and right arms ride independent CAN
         # buses (can0 / can1), so we dispatch their MIT sends and state
@@ -470,6 +485,10 @@ class MotionWorker(QThread):
             self._perf.open()
         except Exception as e:
             logger.warning(f"motion perf log unavailable ({e}); continuing without it")
+        try:
+            self._cart_log.open()
+        except Exception as e:
+            logger.warning(f"cart log unavailable ({e}); continuing without it")
 
         next_tick = time.perf_counter()
         while not self._stop_flag:
@@ -494,6 +513,7 @@ class MotionWorker(QThread):
         # robot service.
         self._can_pool.shutdown(wait=True)
         self._perf.close()
+        self._cart_log.close()
         logger.info("MotionWorker exiting")
 
     def _tick_once(self) -> None:
@@ -611,6 +631,13 @@ class MotionWorker(QThread):
             lead_cap_left=lead_cap_per_arm["left"],
             lead_cap_right=lead_cap_per_arm["right"],
         )
+        # Bump the cart-log tick counter so left + right rows for the
+        # *next* physical tick share a fresh id. Flush every ~1 s
+        # (MOTION_HZ ticks) so a SIGTERM doesn't lose more than a
+        # second of data.
+        self._cart_log.increment_tick()
+        if self._cart_log._tick_index % config.MOTION_HZ == 0:
+            self._cart_log.flush()
 
     def _send_mit_batches(
         self,
@@ -780,6 +807,12 @@ class MotionWorker(QThread):
             self._vr_snapshot[arm] = None
             self._vr_filt_pose[arm] = None
             self._vr_moving[arm] = False
+            # Drop the freshness flag so _cartesian_tick stops driving
+            # the arm. Without this, the last cart_target lingers and
+            # _cartesian_tick keeps re-solving IK against tiny
+            # physical_q jitter, producing the "trembles after grip
+            # release" symptom we saw in hardware testing.
+            self._cart_target_fresh[arm] = False
             return
 
         # From here on the clutch is engaged. Compute the gripper target
@@ -922,7 +955,11 @@ class MotionWorker(QThread):
         )
         if target is None:
             # Either pre-first-press or grip released — leave cart_target
-            # at its last value so the arm freezes.
+            # at its last value so the arm freezes. Drop freshness so
+            # _cartesian_tick stops driving the arm; without this it
+            # keeps re-solving against the stale target and leaks IK
+            # micro-jitter into motor commands (post-release tremble).
+            self._cart_target_fresh[arm] = False
             return
 
         self._apply_vr_cart_target(arm, target, gripper_target)
@@ -1040,36 +1077,107 @@ class MotionWorker(QThread):
             roll=roll, pitch=pitch, yaw=yaw,
             gripper=gripper_target_deg,
         )
+        # Freshness gate: only callers that legitimately want the arm
+        # to *move toward* the target write this flag. Stale ticks
+        # (clutch released, grip dropped, mode just switched) leave
+        # the flag at False and _cartesian_tick will pin to physical.
+        self._cart_target_fresh[arm] = True
 
     def _cartesian_tick(self, arm: str, current: dict[str, float]) -> None:
-        """Solve IK for this arm's cartesian target, overwrite its joint
-        trajectories with the solution. Only runs when arm is in cartesian
-        mode. Joint-space ramp + lead cap run unchanged after this.
+        """Half-step compliance: solve IK from physical q, command part-way
+        toward the solution, write a one-tick degenerate trajectory.
+
+        Per tick:
+          1. physical_q = motor's current 7-vector
+          2. q_B        = solve_IK(target_pose, seed = physical_q)
+          3. delta      = q_B − physical_q
+          4. commanded  = physical_q + alpha * delta
+          5. clamp |commanded[j] − physical_q[j]| ≤ max_joint_step
+          6. overwrite the trajectory as a single-tick step that lands on
+             commanded next setpoint() call
+
+        Why physical_q as the IK seed (not last solution): if the motor
+        can't move (friction at small deltas), an IK seed that drifts
+        ahead of reality compounds tick after tick. Anchoring the seed
+        to motor reality means each solve reflects what's actually
+        reachable from where the arm is right now. The half-step then
+        adds compliance: if the operator's hand barely moved, commanded
+        barely moves too (and may sit below the static-friction torque,
+        in which case the operator pushes harder — closing the loop
+        through their proprioception, not through accumulated software
+        state).
+
+        Joint-space mode is unchanged: keyboard jogging still goes
+        through _set_joint_target → linear ramp → lead cap.
         """
         solver = self._ik_left if arm == "left" else self._ik_right
         target = self._cart_target[arm]
         if solver is None or target is None:
             return
 
-        # Seed from last IK solution if available, else from current motor q.
-        seed = self._last_ik_q_deg[arm]
-        if seed is None:
-            seed = [current.get(f"{arm}_joint_{i+1}.pos", 0.0) for i in range(7)]
+        # Physical-q snapshot. If we can't read every joint we can't run
+        # the half-step (no reference to clamp against), so bail.
+        physical_q: list[float] = []
+        missing = False
+        for i in range(7):
+            v = current.get(f"{arm}_joint_{i+1}.pos")
+            if v is None:
+                missing = True
+                break
+            physical_q.append(float(v))
+        if missing:
+            return
+
+        # Provenance tag for the cart_log. Helps when reading the CSV:
+        # "did this row come from VR-relative, VR-absolute, or the
+        # Cartesian tab spinbox?" — the IK behaviour is the same but
+        # the input characteristics differ.
+        if self._vr_enabled[arm]:
+            log_mode = "vr_abs" if self._vr_absolute[arm] else "vr"
+        else:
+            log_mode = "manual"
+        was_fresh = self._cart_target_fresh[arm]
+
+        # Fix A — drive gate. The flag is sticky state ("operator
+        # currently wants this arm to drive toward _cart_target"), set
+        # by VR ticks while grip is engaged or by the Cartesian tab's
+        # set_cart_target command, cleared on grip release / mode switch
+        # / VR off / estop. When False, hold at physical_q — skipping IK
+        # entirely is the difference between "arm trembles forever after
+        # grip release" and "arm holds still". Saves IK CPU too.
+        if not self._cart_target_fresh[arm]:
+            now = time.perf_counter()
+            for i in range(7):
+                key = f"{arm}_joint_{i+1}.pos"
+                phys = physical_q[i]
+                self._trajectories[key] = JointTrajectory(
+                    start_deg=phys,
+                    target_deg=phys,
+                    total_steps=1,
+                    elapsed_steps=0,
+                    deg_per_tick=0.0,
+                    last_updated=now,
+                )
+            self._cart_log.write_row(
+                arm=arm, mode=log_mode, fresh=was_fresh,
+                gated_hold=True, dead_zone=False,
+                target=target, phys_q=physical_q,
+                ik_q=None, cmd_q=physical_q, ik_result=None,
+            )
+            return
 
         pose = pose_from_xyzrpy(
             target.x, target.y, target.z,
             target.roll, target.pitch, target.yaw,
         )
         result: IKResult = solver.solve(
-            pose, q_seed_deg_7=seed,
+            pose, q_seed_deg_7=physical_q,
             boundary_fallback=self.runtime.ik_boundary_fallback_enabled,
         )
 
-        # The strict 6-DOF solve might fail (request was unreachable at
-        # the requested orientation) but the position-priority fallback
-        # may still produce a usable solution by letting orientation
-        # drift. We freeze only when even the relaxed pass can't get
-        # close enough on POSITION — see IKResult.usable.
+        # Status / freeze logic identical to before — the half-step path
+        # only changes how a *usable* solution gets translated into a
+        # motor setpoint.
         if not result.usable:
             if not self._ik_failed[arm]:
                 logger.warning(
@@ -1081,25 +1189,20 @@ class MotionWorker(QThread):
                 )
                 self.send_error.emit(f"{arm}: IK freeze — target unreachable")
             self._ik_failed[arm] = True
+            self._cart_log.write_row(
+                arm=arm, mode=log_mode, fresh=was_fresh,
+                gated_hold=False, dead_zone=False,
+                target=target, phys_q=physical_q,
+                ik_q=list(result.q_deg), cmd_q=physical_q, ik_result=result,
+            )
             return
 
-        # Result is usable. position_priority_used=True is the expected
-        # path for many "push along one axis" teleop motions — it's not
-        # a failure mode; it just means the wrist orientation drifted
-        # from the commanded value to let position match. We DON'T set
-        # _ik_failed for this — the arm is moving correctly; the only
-        # subtle thing is the wrist isn't exactly tracking commanded
-        # rotation. Logged once per state transition for visibility.
         if result.clamped:
             if not self._ik_failed[arm]:
                 logger.warning(f"{arm}: IK solution clamped to joint limits")
                 self.send_error.emit(f"{arm}: IK solution clamped to joint limits")
             self._ik_failed[arm] = True
         elif result.boundary_clamped:
-            # Workspace edge: target was past the reachable region; the
-            # solver returned the largest reachable fraction along the
-            # current→target line, with strict orientation preserved.
-            # Arm extends toward operator's hand instead of freezing.
             if not self._ik_boundary[arm]:
                 logger.info(
                     f"{arm}: workspace edge — target ~{result.pos_err_mm:.0f}mm "
@@ -1108,37 +1211,92 @@ class MotionWorker(QThread):
                 )
                 self.send_error.emit(f"{arm}: workspace edge")
             self._ik_boundary[arm] = True
-            # Not a freeze; keep _ik_failed clear so the next normal
-            # solve doesn't trip the "IK recovered" log on every tick.
             if self._ik_failed[arm]:
                 self._ik_failed[arm] = False
         else:
-            # Healthy: either strict converged, or position-priority
-            # found a usable solution. Clear any stale warning.
             if self._ik_failed[arm] or self._ik_boundary[arm]:
                 logger.info(f"{arm}: IK recovered")
                 self.send_error.emit("")
             self._ik_failed[arm] = False
             self._ik_boundary[arm] = False
 
+        # Keep _last_ik_q_deg as a debug breadcrumb (tools/replay reads
+        # it from logs) but it's no longer the seed source.
         self._last_ik_q_deg[arm] = list(result.q_deg)
 
-        # Route IK's joint targets through the shared helper so the
-        # per-tick IK updates also get the extend-in-same-direction
-        # treatment (otherwise holding a cartesian jog key would hit
-        # the same accumulation bug as the joint-space path).
-        speed = self.runtime.max_speed_deg_per_sec
-        for i in range(7):
-            joint = f"joint_{i+1}"
-            key = f"{arm}_{joint}.pos"
-            cur = current.get(key)
-            if cur is None:
-                continue
-            self._set_joint_target(key, float(cur), float(result.q_deg[i]), speed)
+        alpha = float(self.runtime.vr_cartesian_alpha)
+        max_step = float(self.runtime.vr_cartesian_max_joint_step_deg)
+        dead_zone = config.VR_CARTESIAN_DEAD_ZONE_DEG
+        now = time.perf_counter()
 
-        # Gripper is not part of IK; if target specifies one, send it too.
-        # Gripper has its own speed cap (independent of arm-joint speed)
-        # so it can snap on trigger rather than ramping like a joint.
+        # Fix B — joint-delta dead-zone. If every joint's IK delta is
+        # below the threshold, the target pose is effectively where the
+        # arm already is; the small residuals are IK micro-noise from
+        # the tick-to-tick variation in physical_q seed. Pin to physical
+        # to suppress the buzz. Per-joint check (not L2 norm) so a
+        # genuine large move on one joint isn't masked by six small
+        # ones — we only suppress when *every* joint is near zero.
+        max_abs_delta = 0.0
+        for i in range(7):
+            d = abs(float(result.q_deg[i]) - physical_q[i])
+            if d > max_abs_delta:
+                max_abs_delta = d
+        cmd_q: list[float] = []
+        if max_abs_delta < dead_zone:
+            for i in range(7):
+                key = f"{arm}_joint_{i+1}.pos"
+                phys = physical_q[i]
+                self._trajectories[key] = JointTrajectory(
+                    start_deg=phys,
+                    target_deg=phys,
+                    total_steps=1,
+                    elapsed_steps=0,
+                    deg_per_tick=0.0,
+                    last_updated=now,
+                )
+                cmd_q.append(phys)
+            self._cart_log.write_row(
+                arm=arm, mode=log_mode, fresh=was_fresh,
+                gated_hold=False, dead_zone=True,
+                target=target, phys_q=physical_q,
+                ik_q=list(result.q_deg), cmd_q=cmd_q, ik_result=result,
+            )
+        else:
+            for i in range(7):
+                phys = physical_q[i]
+                q_b = float(result.q_deg[i])
+                commanded = phys + alpha * (q_b - phys)
+                # Per-joint, per-tick step cap: hard bound on torque demand
+                # if target_pose jumped a lot in one tick.
+                if commanded > phys + max_step:
+                    commanded = phys + max_step
+                elif commanded < phys - max_step:
+                    commanded = phys - max_step
+                key = f"{arm}_joint_{i+1}.pos"
+                # Degenerate one-tick trajectory: setpoint() returns
+                # target on the very next call, no ramping. The half-
+                # step itself is the rate-limiter; we don't want
+                # JointTrajectory.new's speed-derived multi-tick ramp
+                # to subdivide it further.
+                self._trajectories[key] = JointTrajectory(
+                    start_deg=phys,
+                    target_deg=commanded,
+                    total_steps=1,
+                    elapsed_steps=0,
+                    deg_per_tick=0.0,
+                    last_updated=now,
+                )
+                cmd_q.append(commanded)
+            self._cart_log.write_row(
+                arm=arm, mode=log_mode, fresh=was_fresh,
+                gated_hold=False, dead_zone=False,
+                target=target, phys_q=physical_q,
+                ik_q=list(result.q_deg), cmd_q=cmd_q, ik_result=result,
+            )
+
+        # Gripper still rides the existing trajectory ramp because its
+        # behavior is intentionally different (snap on trigger, own
+        # speed cap). Half-step doesn't apply.
         if target.gripper is not None:
             key = f"{arm}_gripper.pos"
             cur = current.get(key)
@@ -1203,10 +1361,18 @@ class MotionWorker(QThread):
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
                     self._ik_boundary[arm] = False
+                    # Clear freshness so a switch into cartesian holds
+                    # the arm at physical_q until the operator deliberately
+                    # writes a target.
+                    self._cart_target_fresh[arm] = False
                     logger.info(f"{arm}: mode set to {mode}")
             elif cmd.kind == "set_cart_target":
                 if cmd.arm in self._cart_target:
                     self._cart_target[cmd.arm] = cmd.cart_target
+                    # Cartesian tab spinbox / arrow → operator wants
+                    # the arm to move there. Same freshness gate that
+                    # the VR path uses.
+                    self._cart_target_fresh[cmd.arm] = True
             elif cmd.kind == "vr_enable":
                 arm = cmd.arm or ""
                 enabled = bool(cmd.torque_enabled)
@@ -1229,6 +1395,11 @@ class MotionWorker(QThread):
                             x=x, y=y, z=z,
                             roll=roll, pitch=pitch, yaw=yaw,
                         )
+                    # Don't mark fresh — the FK-seeded target is the
+                    # arm's *current* pose; nothing to move toward
+                    # until the operator engages grip and the VR tick
+                    # starts writing real targets.
+                    self._cart_target_fresh[arm] = False
                     logger.info(
                         f"{arm}: VR control ENABLED; arm switched to cartesian "
                         f"mode (Phase 2b-α — not yet tracking controller pose)"
@@ -1239,6 +1410,7 @@ class MotionWorker(QThread):
                     # the joint-mode per-tick path on the next tick.
                     self._mode[arm] = "joint"
                     self._cart_target[arm] = None
+                    self._cart_target_fresh[arm] = False
                     self._vr_snapshot[arm] = None
                     self._vr_filt_pose[arm] = None
                     self._vr_moving[arm] = False
@@ -1284,6 +1456,7 @@ class MotionWorker(QThread):
                 for arm in ("left", "right"):
                     self._mode[arm] = "joint"
                     self._cart_target[arm] = None
+                    self._cart_target_fresh[arm] = False
                     self._last_ik_q_deg[arm] = None
                     self._ik_failed[arm] = False
                     self._ik_boundary[arm] = False

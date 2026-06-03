@@ -40,6 +40,8 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "vr_rot_scale",
     "vr_receiver_backend",
     "ik_boundary_fallback_enabled",
+    "vr_cartesian_alpha",
+    "vr_cartesian_max_joint_step_deg",
 )
 
 
@@ -137,6 +139,8 @@ def reset_to_defaults(state: RuntimeState) -> dict[str, object]:
         "vr_rot_scale": config.INITIAL_VR_ROT_SCALE,
         "vr_receiver_backend": config.VR_RECEIVER_BACKEND,
         "ik_boundary_fallback_enabled": config.INITIAL_IK_BOUNDARY_FALLBACK_ENABLED,
+        "vr_cartesian_alpha": config.INITIAL_VR_CARTESIAN_ALPHA,
+        "vr_cartesian_max_joint_step_deg": config.INITIAL_VR_CARTESIAN_MAX_JOINT_STEP_DEG,
     }
     applied: dict[str, object] = {}
     for name in PERSISTED_FIELDS:

@@ -276,6 +276,49 @@ class SystemTab(QWidget):
         self.vr_rot_spin.valueChanged.connect(self._on_vr_rot_scale_changed)
         speed_form.addRow("VR rotation gain:", self.vr_rot_spin)
 
+        # Cartesian half-step compliance ratio. Higher = more aggressive
+        # tracking of the IK target; lower = more compliant (operator
+        # has to push the controller further to drive motion).
+        self.cart_alpha_spin = QDoubleSpinBox()
+        self.cart_alpha_spin.setDecimals(2)
+        self.cart_alpha_spin.setRange(uiconfig.VR_CARTESIAN_ALPHA_MIN,
+                                      uiconfig.VR_CARTESIAN_ALPHA_MAX)
+        self.cart_alpha_spin.setSingleStep(uiconfig.VR_CARTESIAN_ALPHA_STEP)
+        self.cart_alpha_spin.setValue(self.state.vr_cartesian_alpha)
+        self.cart_alpha_spin.setToolTip(
+            "Cartesian-mode tracking ratio. commanded_q = physical_q + "
+            "alpha × (q_IK − physical_q). 1.0 = full IK target each tick "
+            "(stiff); lower = more compliant. Only applies in cartesian "
+            "mode (VR / Cartesian tab)."
+        )
+        self.cart_alpha_spin.valueChanged.connect(self._on_cart_alpha_changed)
+        speed_form.addRow("Cartesian tracking α:", self.cart_alpha_spin)
+
+        # Per-joint per-tick cap in cartesian mode. Bounds the torque
+        # demand if the target_pose jumps abruptly.
+        self.cart_max_step_spin = QDoubleSpinBox()
+        self.cart_max_step_spin.setDecimals(1)
+        self.cart_max_step_spin.setRange(
+            uiconfig.VR_CARTESIAN_MAX_JOINT_STEP_DEG_MIN,
+            uiconfig.VR_CARTESIAN_MAX_JOINT_STEP_DEG_MAX,
+        )
+        self.cart_max_step_spin.setSingleStep(
+            uiconfig.VR_CARTESIAN_MAX_JOINT_STEP_DEG_STEP
+        )
+        self.cart_max_step_spin.setSuffix(" °/tick")
+        self.cart_max_step_spin.setValue(
+            self.state.vr_cartesian_max_joint_step_deg
+        )
+        self.cart_max_step_spin.setToolTip(
+            "Per-joint, per-tick step cap in cartesian mode. At 30 Hz, "
+            "3°/tick = 90°/s peak. Independent of the arm-joint speed "
+            "above (which only gates joint-space mode)."
+        )
+        self.cart_max_step_spin.valueChanged.connect(
+            self._on_cart_max_step_changed
+        )
+        speed_form.addRow("Cartesian joint step cap:", self.cart_max_step_spin)
+
         # IK boundary-clamp fallback toggle (pass 3). When checked,
         # unreachable cartesian targets get walked back to the workspace
         # edge instead of freezing the arm. Off matches pre-pass-3
@@ -461,6 +504,14 @@ class SystemTab(QWidget):
         self.state.vr_rot_scale = float(value)
         logger.info(f"VR rotation gain set to {value:.2f}")
 
+    def _on_cart_alpha_changed(self, value: float) -> None:
+        self.state.vr_cartesian_alpha = float(value)
+        logger.info(f"cartesian tracking alpha set to {value:.2f}")
+
+    def _on_cart_max_step_changed(self, value: float) -> None:
+        self.state.vr_cartesian_max_joint_step_deg = float(value)
+        logger.info(f"cartesian joint step cap set to {value:.1f} °/tick")
+
     def _on_ik_boundary_toggled(self, checked: bool) -> None:
         self.state.ik_boundary_fallback_enabled = bool(checked)
         logger.info(
@@ -507,6 +558,8 @@ class SystemTab(QWidget):
             (self.gcomp_spin, self.state.gravity_comp_scale),
             (self.vr_pos_spin, self.state.vr_pos_scale),
             (self.vr_rot_spin, self.state.vr_rot_scale),
+            (self.cart_alpha_spin, self.state.vr_cartesian_alpha),
+            (self.cart_max_step_spin, self.state.vr_cartesian_max_joint_step_deg),
         ):
             spin.blockSignals(True)
             spin.setValue(float(value))

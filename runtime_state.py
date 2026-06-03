@@ -38,6 +38,15 @@ class RuntimeState:
     # (pre-pass-3 behavior). Toggle exists so the user can A/B
     # the feel on hardware.
     ik_boundary_fallback_enabled: bool = config.INITIAL_IK_BOUNDARY_FALLBACK_ENABLED
+    # Cartesian-mode half-step compliance ratio. commanded_q =
+    # physical_q + alpha * (q_IK - physical_q), so higher alpha
+    # tracks the IK target more aggressively, lower alpha is more
+    # compliant. See config.INITIAL_VR_CARTESIAN_ALPHA.
+    vr_cartesian_alpha: float = config.INITIAL_VR_CARTESIAN_ALPHA
+    # Per-joint per-tick step cap in cartesian mode. Bounds the
+    # torque demand when target_pose jumps. Independent of
+    # max_speed_deg_per_sec (which only gates joint-space mode).
+    vr_cartesian_max_joint_step_deg: float = config.INITIAL_VR_CARTESIAN_MAX_JOINT_STEP_DEG
 
     def max_step_per_tick(self, poll_hz: int = config.POLL_HZ) -> float:
         """Max degrees the commanded value can move per poll tick."""

@@ -137,6 +137,15 @@ VR_RECORDINGS_DIR = LOCAL_DATA_DIR / "vr_recordings"
 # the source for the periodic summary line on the standard logger.
 PERF_LOG_DIR = LOCAL_DATA_DIR / "perf_logs"
 
+# Per-tick-per-arm cartesian decision log. One CSV per session,
+# one row per (tick, arm) when the arm is in cartesian mode. Captures
+# what the IK saw (target pose, physical q), what it produced (IK q,
+# convergence flags, error), and what we commanded (after half-step,
+# dead-zone, lead-cap). Wider than perf_log — ~400 bytes/row, ~24
+# kB/s with both arms in cartesian mode. Designed to be loaded with
+# pandas for offline trembling/oscillation analysis.
+CART_LOG_DIR = LOCAL_DATA_DIR / "cart_logs"
+
 # Camera snapshot diagnostic dumps. The System tab's "Camera Snapshots"
 # button writes one PNG per camera (plus a swapped-R/B variant) here
 # so the user can confirm their camera is delivering RGB vs BGR.
@@ -231,6 +240,46 @@ INITIAL_VR_ROT_SCALE = 1.0  # rotation gain; 1.0 = arm wrist follows hand 1:1
 VR_SCALE_MIN = 0.05
 VR_SCALE_MAX = 5.0
 VR_SCALE_STEP = 0.05
+
+# ── Cartesian half-step compliance ────────────────────────────────────
+# When an arm is in cartesian mode the motion worker drops the linear
+# joint-space ramp and instead, every tick, computes
+#
+#     q_B       = solve_IK(target_pose, seed = physical_q)
+#     commanded = physical_q + alpha * (q_B − physical_q)
+#
+# clamped per-joint to ±max_joint_step_deg around physical_q. The IK
+# seed is the *current motor position*, not last tick's IK solution,
+# so the commanded setpoint can never drift away from where the arm
+# actually is. The half-step (alpha < 1) means commanded always sits
+# between physical and the reachable IK solution: the operator sees
+# the arm respond, but no one tick demands a huge instantaneous step.
+#
+# alpha (0..1): higher = more aggressive tracking, lower = more
+# compliant (operator must push harder to drive motion). Default 0.7
+# leans toward responsive; tune from the System tab.
+INITIAL_VR_CARTESIAN_ALPHA = 0.7
+VR_CARTESIAN_ALPHA_MIN = 0.1
+VR_CARTESIAN_ALPHA_MAX = 1.0
+VR_CARTESIAN_ALPHA_STEP = 0.05
+
+# Per-joint, per-tick cap on (commanded − physical). Bounds the
+# torque demand if target_pose jumps abruptly (fast hand motion or a
+# VR packet that just crossed the dead-band). At 30 Hz, 3°/tick =
+# 90°/s peak per joint, which is a brisk but safe motion.
+INITIAL_VR_CARTESIAN_MAX_JOINT_STEP_DEG = 3.0
+VR_CARTESIAN_MAX_JOINT_STEP_DEG_MIN = 1.0
+VR_CARTESIAN_MAX_JOINT_STEP_DEG_MAX = 10.0
+VR_CARTESIAN_MAX_JOINT_STEP_DEG_STEP = 0.5
+
+# Per-joint dead-zone on the IK delta. If the largest |q_B[j] −
+# physical_q[j]| is below this threshold, _cartesian_tick commands
+# physical_q directly (no half-step, no motion). Suppresses the
+# tick-to-tick IK micro-jitter you get when the same target_pose
+# is solved against a slightly-different physical_q every tick.
+# 0.05° per joint is below the resolution that any motor can
+# reliably track and well below operator-perceptible motion.
+VR_CARTESIAN_DEAD_ZONE_DEG = 0.05
 
 # IK boundary-clamp fallback (ik_solver pass 3). When enabled, IK
 # targets past the workspace are walked back to the boundary along
